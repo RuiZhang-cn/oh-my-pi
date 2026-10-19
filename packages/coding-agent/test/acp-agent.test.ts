@@ -23,8 +23,14 @@ import type {
 	UsageFallbackConfirmation,
 } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
+import { closeSessionIndex, lookupSessionTitle } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { FileSessionStorage, type WriteTextAtomicOptions } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import {
+	parseTitleSlotFromContent,
+	serializeTitleSlot,
+	type SessionTitleUpdate,
+} from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
@@ -414,13 +420,14 @@ class FakeAgentSession {
 	}
 }
 
-function holdPromptStreaming(session: FakeAgentSession): () => void {
+function holdPromptStreaming(session: FakeAgentSession, started?: () => void): () => void {
 	let finishPrompt!: () => void;
 	session.prompt = async (text: string): Promise<boolean> => {
 		session.promptCalls.push(text);
 		session.isStreaming = true;
 		const blocker = Promise.withResolvers<void>();
 		finishPrompt = blocker.resolve;
+		started?.();
 		await blocker.promise;
 		const assistantMessage = makeAssistantMessage("pong");
 		for (const listener of session.listeners()) {
@@ -1280,6 +1287,1005 @@ describe("ACP agent", () => {
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
+
+	it("updates the real live title during a reply without prompting, cancelling, or changing identity", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const params = { sessionId: created.sessionId, cwd: harness.cwdA };
+		expect(await harness.agent.extMethod("_omp/session/title", params)).toEqual({
+			sessionId: created.sessionId,
+			title: "",
+			source: undefined,
+			status: "unchanged",
+		});
+		expect(
+			(
+				await SessionManager.accessStoredSessionTitle(
+					session.sessionManager.getSessionFile()!,
+					created.sessionId,
+					harness.cwdA,
+					{},
+				)
+			).status,
+		).toBe("busy");
+		session.sessionManager.appendMessage({ role: "user", content: "keep my chat", timestamp: 1 });
+		session.sessionManager.appendMessage(makeAssistantMessage("keep my model and usage"));
+		const messages = session.sessionManager.getEntries().filter(entry => entry.type === "message");
+		const started = Promise.withResolvers<void>();
+		const finishPrompt = holdPromptStreaming(session, started.resolve);
+		const prompt = harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "keep replying" }],
+		});
+		await started.promise;
+		try {
+			expect(session.isStreaming).toBe(true);
+			const before = harness.updates.length;
+			expect(
+				await harness.agent.extMethod("_omp/session/title", {
+					...params,
+					title: "MindFS title",
+					expectedTitle: "",
+					onlyIfEmpty: true,
+				}),
+			).toEqual({ sessionId: created.sessionId, title: "MindFS title", source: "auto", status: "updated" });
+			expect(session.isStreaming).toBe(true);
+			expect(session.promptCalls).toEqual(["keep replying"]);
+			expect(session.sessionId).toBe(created.sessionId);
+			expect(session.sessionManager.getSessionId()).toBe(created.sessionId);
+			expect(session.sessionManager.getEntries().filter(entry => entry.type === "message")).toEqual(messages);
+			expect(
+				parseTitleSlotFromContent(await Bun.file(session.sessionManager.getSessionFile()!).text()),
+			).toMatchObject({
+				title: "MindFS title",
+				source: "auto",
+			});
+			expect(lookupSessionTitle(created.sessionId)).toBe("MindFS title");
+			const updates = harness.updates.slice(before);
+			expect(updates).toContainEqual(
+				expect.objectContaining({
+					sessionId: created.sessionId,
+					update: expect.objectContaining({ sessionUpdate: "session_info_update", title: "MindFS title" }),
+				}),
+			);
+			expect(updates.map(notification => notification.update.sessionUpdate)).not.toContain("message_done");
+		} finally {
+			finishPrompt();
+			await prompt;
+			await harness.agent.closeSession({ sessionId: created.sessionId });
+			await harness.agent.dispose();
+		}
+	});
+
+	it("enforces exact title CAS and native user precedence for live and cold sessions", async () => {
+		const harness = await createHarness();
+		const { sessionId } = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const params = { sessionId, cwd: harness.cwdA };
+		const call = (request: Record<string, unknown>) =>
+			harness.agent.extMethod("_omp/session/title", { ...params, ...request });
+		try {
+			expect((await call({ title: "generated", expectedTitle: "" })).status).toBe("updated");
+			const file = harness.findSession(sessionId)!.sessionManager.getSessionFile()!;
+			const unchangedBody = await Bun.file(file).text();
+			expect((await call({ title: "generated", source: "user", onlyIfEmpty: true })).status).toBe("kept");
+			expect(await call({})).toMatchObject({ title: "generated", source: "auto", status: "unchanged" });
+			expect(await Bun.file(file).text()).toBe(unchangedBody);
+			expect((await call({ title: "stale", expectedTitle: "" })).status).toBe("conflict");
+			expect((await call({ title: "backfill", onlyIfEmpty: true })).status).toBe("kept");
+			expect((await call({ title: "generated", expectedTitle: "generated" })).status).toBe("unchanged");
+			expect((await call({ title: "native manual", expectedTitle: "generated", source: "user" })).status).toBe(
+				"updated",
+			);
+			expect((await call({ title: "auto must not win", expectedTitle: "native manual" })).status).toBe("kept");
+			await harness.agent.closeSession({ sessionId });
+			const factories = harness.sessionFactoryOptions.length;
+			expect(await call({})).toEqual({ sessionId, title: "native manual", source: "user", status: "unchanged" });
+			const manualBody = await Bun.file(file).text();
+			expect((await call({ title: "native manual", source: "user", onlyIfEmpty: true })).status).toBe("kept");
+			expect(await Bun.file(file).text()).toBe(manualBody);
+			expect((await call({ title: "auto must still not win", expectedTitle: "native manual" })).status).toBe("kept");
+			expect((await call({ title: "explicit rename", source: "user", expectedTitle: "wrong" })).status).toBe(
+				"conflict",
+			);
+			expect(await call({ title: "explicit rename", source: "user", expectedTitle: "native manual" })).toEqual({
+				sessionId,
+				title: "explicit rename",
+				source: "user",
+				status: "updated",
+			});
+			expect(await call({})).toEqual({ sessionId, title: "explicit rename", source: "user", status: "unchanged" });
+			expect(harness.sessionFactoryOptions).toHaveLength(factories);
+		} finally {
+			await harness.agent.dispose();
+		}
+	});
+
+	it("persists long Chinese and emoji titles without splitting code points and makes repeated requests idempotent", async () => {
+		const harness = await createHarness();
+		const { sessionId } = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(sessionId)!;
+		const request = { sessionId, cwd: harness.cwdA, title: "同步危险货物运单🚚😀".repeat(40), source: "user" };
+		try {
+			const result = await harness.agent.extMethod("_omp/session/title", request);
+			expect(result.status).toBe("updated");
+			expect(typeof result.title).toBe("string");
+			const title = result.title as string;
+			expect(title.length).toBeGreaterThan(0);
+			expect(title.length).toBeLessThan(request.title.length);
+			expect(request.title.startsWith(title)).toBe(true);
+			expect(title.isWellFormed()).toBe(true);
+			expect(title).not.toContain("\uFFFD");
+			const file = session.sessionManager.getSessionFile()!;
+			const body = await Bun.file(file).text();
+			expect(parseTitleSlotFromContent(body)?.title).toBe(title);
+			expect((await harness.agent.extMethod("_omp/session/title", request)).status).toBe("unchanged");
+			expect(await Bun.file(file).text()).toBe(body);
+			await harness.agent.closeSession({ sessionId });
+			expect(await harness.agent.extMethod("_omp/session/title", { sessionId, cwd: harness.cwdA })).toMatchObject({
+				sessionId,
+				title,
+				source: "user",
+				status: "unchanged",
+			});
+			expect((await harness.agent.extMethod("_omp/session/title", request)).status).toBe("unchanged");
+			expect(await Bun.file(file).text()).toBe(body);
+		} finally {
+			await harness.agent.dispose();
+		}
+	});
+
+	it("backfills cold slotted metadata without loading malformed chat or resolving missing image blobs", async () => {
+		const harness = await createHarness();
+		const manager = SessionManager.create(harness.cwdA);
+		await manager.ensureOnDisk();
+		manager.appendMessage({ role: "user", content: "preserved chat", timestamp: 1 });
+		manager.appendMessage(makeAssistantMessage("preserved model and usage"));
+		const file = manager.getSessionFile()!;
+		const sessionId = manager.getSessionId();
+		const parentId = manager.getEntries().at(-1)!.id;
+		await manager.close();
+		const missingImage = {
+			type: "message",
+			id: "missing-image",
+			parentId,
+			timestamp: new Date().toISOString(),
+			message: {
+				role: "user",
+				timestamp: 2,
+				content: [{ type: "image", data: `blob:sha256:${"f".repeat(64)}`, mimeType: "image/png" }],
+			},
+		};
+		await Bun.write(
+			file,
+			(await Bun.file(file).text()) + `{broken:${"x".repeat(70_000)}\n${JSON.stringify(missingImage)}\n`,
+		);
+		const before = await Bun.file(file).text();
+		const factories = harness.sessionFactoryOptions.length;
+		const fullRead = spyOn(FileSessionStorage.prototype, "readText").mockRejectedValue(
+			new Error("chat must not load"),
+		);
+		try {
+			expect(
+				await harness.agent.extMethod("_omp/session/title", {
+					sessionId,
+					cwd: harness.cwdA,
+					title: "cold backfill",
+					expectedTitle: "",
+					onlyIfEmpty: true,
+				}),
+			).toEqual({ sessionId, title: "cold backfill", source: "auto", status: "updated" });
+			expect(fullRead).not.toHaveBeenCalled();
+			expect(harness.sessionFactoryOptions).toHaveLength(factories);
+			const after = await Bun.file(file).text();
+			expect(after.slice(after.indexOf("\n") + 1).startsWith(before.slice(before.indexOf("\n") + 1))).toBe(true);
+			const journal = JSON.parse(after.trimEnd().slice(after.trimEnd().lastIndexOf("\n") + 1));
+			expect(journal).toMatchObject({
+				type: "title_change",
+				title: "cold backfill",
+				source: "auto",
+				parentId: "missing-image",
+			});
+			expect(parseTitleSlotFromContent(after)).toMatchObject({ title: "cold backfill", source: "auto" });
+			expect(lookupSessionTitle(sessionId)).toBe("cold backfill");
+			expect(await harness.agent.extMethod("_omp/session/title", { sessionId, cwd: harness.cwdA })).toEqual({
+				sessionId,
+				title: "cold backfill",
+				source: "auto",
+				status: "unchanged",
+			});
+			expect((await SessionManager.list(harness.cwdA)).find(session => session.id === sessionId)?.title).toBe(
+				"cold backfill",
+			);
+		} finally {
+			fullRead.mockRestore();
+			await harness.agent.dispose();
+		}
+	});
+
+	it("inserts a legacy title slot without changing native identity or chat bytes and rejects corrupt legacy history", async () => {
+		const harness = await createHarness();
+		const manager = SessionManager.create(harness.cwdA);
+		await manager.ensureOnDisk();
+		manager.appendMessage({ role: "user", content: "legacy user", timestamp: 1 });
+		manager.appendMessage(makeAssistantMessage("legacy assistant"));
+		const messages = manager.getEntries().filter(entry => entry.type === "message");
+		const sessionId = manager.getSessionId();
+		const file = manager.getSessionFile()!;
+		await manager.close();
+		const modern = await Bun.file(file).text();
+		const legacy = modern.slice(modern.indexOf("\n") + 1);
+		await Bun.write(file, legacy);
+		try {
+			const liveLegacy = await SessionManager.open(file, undefined, undefined, {
+				suppressBreadcrumb: true,
+				throwIfMissing: true,
+			});
+			try {
+				expect(await liveLegacy.accessSessionTitle({ title: "live legacy", expectedTitle: "" })).toMatchObject({
+					sessionId,
+					title: "live legacy",
+					source: "auto",
+					status: "updated",
+				});
+				expect(liveLegacy.getSessionId()).toBe(sessionId);
+				expect(liveLegacy.getEntries().filter(entry => entry.type === "message")).toEqual(messages);
+			} finally {
+				await liveLegacy.close();
+			}
+			await Bun.write(file, legacy);
+			const params = { sessionId, cwd: harness.cwdA, title: "legacy rename", expectedTitle: "", source: "user" };
+			expect((await harness.agent.extMethod("_omp/session/title", { ...params, cwd: harness.cwdB })).status).toBe(
+				"not_found",
+			);
+			expect(await Bun.file(file).text()).toBe(legacy);
+			expect((await harness.agent.extMethod("_omp/session/title", params)).status).toBe("updated");
+			const after = await Bun.file(file).text();
+			expect(after.slice(after.indexOf("\n") + 1).startsWith(legacy)).toBe(true);
+			const reopened = await SessionManager.open(file, undefined, undefined, {
+				suppressBreadcrumb: true,
+				throwIfMissing: true,
+			});
+			try {
+				expect(reopened.getSessionId()).toBe(sessionId);
+				expect(reopened.getHeader()).toMatchObject({ title: "legacy rename", titleSource: "user" });
+				expect(reopened.getEntries().filter(entry => entry.type === "message")).toEqual(messages);
+			} finally {
+				await reopened.close();
+			}
+			const corrupt = `${legacy}not-json\n`;
+			await Bun.write(file, corrupt);
+			await expect(
+				SessionManager.accessStoredSessionTitle(file, sessionId, harness.cwdA, { title: "must fail" }),
+			).rejects.toThrow("malformed history");
+			expect(await Bun.file(file).text()).toBe(corrupt);
+			expect((await SessionManager.list(harness.cwdA)).filter(session => session.id === sessionId)).toHaveLength(1);
+		} finally {
+			await harness.agent.dispose();
+		}
+	});
+
+	it("returns invalid-parameter errors and exact-ID or cwd misses without writing", async () => {
+		const harness = await createHarness();
+		const { sessionId } = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(sessionId)!;
+		const params = { sessionId, cwd: harness.cwdA };
+		const file = session.sessionManager.getSessionFile()!;
+		const before = await Bun.file(file).text();
+		try {
+			for (const bad of [
+				{ sessionId: "" },
+				{ cwd: "relative" },
+				{ title: " " },
+				{ title: 3 },
+				{ title: "\u0000\u0001\u007f" },
+				{ expectedTitle: null },
+				{ onlyIfEmpty: "yes" },
+				{ source: "system" },
+			]) {
+				await expect(harness.agent.extMethod("_omp/session/title", { ...params, ...bad })).rejects.toMatchObject({
+					code: -32602,
+				});
+			}
+			expect(
+				(
+					await harness.agent.extMethod("_omp/session/title", {
+						...params,
+						cwd: harness.cwdB,
+						title: "wrong project",
+					})
+				).status,
+			).toBe("not_found");
+			expect(
+				await harness.agent.extMethod("_omp/session/title", {
+					...params,
+					sessionId: "unbound-native-id",
+					title: "missing",
+				}),
+			).toEqual({
+				sessionId: "unbound-native-id",
+				title: "",
+				status: "not_found",
+			});
+			expect(await Bun.file(file).text()).toBe(before);
+		} finally {
+			await harness.agent.dispose();
+		}
+	});
+
+	it("propagates native ownership and title-slot I/O failures without success or a sibling session", async () => {
+		const harness = await createHarness();
+		const manager = SessionManager.create(harness.cwdA);
+		await manager.ensureOnDisk();
+		manager.appendMessage({ role: "user", content: "keep", timestamp: 1 });
+		const file = manager.getSessionFile()!;
+		const sessionId = manager.getSessionId();
+		await manager.close();
+		const before = await Bun.file(file).text();
+		class UnavailableOwnershipStorage extends FileSessionStorage {
+			override claimSessionForMetadata(): (() => void) | null {
+				throw new Error("ownership unavailable");
+			}
+		}
+		class FailedTitleStorage extends FileSessionStorage {
+			override async updateSessionTitle(): Promise<void> {
+				throw new Error("title slot I/O failed");
+			}
+		}
+		try {
+			await expect(
+				SessionManager.accessStoredSessionTitle(
+					file,
+					sessionId,
+					harness.cwdA,
+					{ title: "fail closed" },
+					new UnavailableOwnershipStorage(),
+				),
+			).rejects.toThrow("ownership unavailable");
+			expect(await Bun.file(file).text()).toBe(before);
+			await expect(
+				SessionManager.accessStoredSessionTitle(
+					file,
+					sessionId,
+					harness.cwdA,
+					{ title: "no fake success" },
+					new FailedTitleStorage(),
+				),
+			).rejects.toThrow("title slot I/O failed");
+			const after = await Bun.file(file).text();
+			expect(parseTitleSlotFromContent(after)?.title).toBe("");
+			expect(after.slice(after.indexOf("\n") + 1).startsWith(before.slice(before.indexOf("\n") + 1))).toBe(true);
+			expect((await SessionManager.list(harness.cwdA)).filter(session => session.id === sessionId)).toHaveLength(1);
+		} finally {
+			await harness.agent.dispose();
+		}
+	});
+
+	it("requires strict live metadata ownership even after an ordinary manager accepted an unlocked fallback", async () => {
+		const harness = await createHarness();
+		let ordinaryClaims = 0;
+		let strictClaims = 0;
+		class UnlockedLiveStorage extends FileSessionStorage {
+			override claimSession(): (() => void) | null {
+				ordinaryClaims++;
+				return () => {};
+			}
+			override claimSessionForMetadata(): (() => void) | null {
+				strictClaims++;
+				throw new Error("native lease unavailable");
+			}
+		}
+		const manager = SessionManager.create(harness.cwdA, undefined, new UnlockedLiveStorage());
+		await manager.ensureOnDisk();
+		const sessionId = manager.getSessionId();
+		const file = manager.getSessionFile()!;
+		const before = await Bun.file(file).text();
+		try {
+			expect(ordinaryClaims).toBeGreaterThan(0);
+			for (const request of [{}, { title: "not owned", expectedTitle: "" }]) {
+				await expect(manager.accessSessionTitle(request)).rejects.toThrow("native lease unavailable");
+			}
+			expect(strictClaims).toBe(2);
+			expect(await Bun.file(file).text()).toBe(before);
+			expect(manager.getSessionId()).toBe(sessionId);
+			expect(manager.getSessionFile()).toBe(file);
+			expect(manager.getSessionName()).toBeUndefined();
+		} finally {
+			await manager.close();
+			await harness.agent.dispose();
+		}
+	});
+
+	it("returns the committed metadata snapshot rather than a concurrent unpersisted ordinary rename", async () => {
+		const harness = await createHarness();
+		const metadataEntered = Promise.withResolvers<void>();
+		const metadataRelease = Promise.withResolvers<void>();
+		const ordinaryEntered = Promise.withResolvers<void>();
+		const ordinaryRelease = Promise.withResolvers<void>();
+		class ControlledLiveTitleStorage extends FileSessionStorage {
+			override async updateSessionTitle(file: string, update: SessionTitleUpdate): Promise<void> {
+				if (update.title === "metadata committed") {
+					metadataEntered.resolve();
+					await metadataRelease.promise;
+				} else if (update.title === "ordinary still pending") {
+					ordinaryEntered.resolve();
+					await ordinaryRelease.promise;
+				}
+				await super.updateSessionTitle(file, update);
+			}
+		}
+		const manager = SessionManager.create(harness.cwdA, undefined, new ControlledLiveTitleStorage());
+		await manager.ensureOnDisk();
+		const file = manager.getSessionFile()!;
+		const sessionId = manager.getSessionId();
+		const first = manager.accessSessionTitle({ title: "metadata committed", expectedTitle: "" });
+		let ordinary: Promise<boolean> | undefined;
+		try {
+			await metadataEntered.promise;
+			expect(
+				(await manager.accessSessionTitle({ title: "parallel metadata", expectedTitle: "metadata committed" }))
+					.status,
+			).toBe("busy");
+			ordinary = manager.setSessionName("ordinary still pending", "user");
+			expect(manager.getSessionName()).toBe("ordinary still pending");
+			metadataRelease.resolve();
+			expect(await first).toEqual({ sessionId, title: "metadata committed", source: "auto", status: "updated" });
+			await ordinaryEntered.promise;
+			expect(parseTitleSlotFromContent(await Bun.file(file).text())).toMatchObject({
+				title: "metadata committed",
+				source: "auto",
+			});
+			expect((await manager.accessSessionTitle({})).status).toBe("busy");
+			expect((await manager.accessSessionTitle({ title: "ordinary still pending", source: "user" })).status).toBe(
+				"busy",
+			);
+			ordinaryRelease.resolve();
+			expect(await ordinary).toBe(true);
+			expect(await manager.accessSessionTitle({})).toEqual({
+				sessionId,
+				title: "ordinary still pending",
+				source: "user",
+				status: "unchanged",
+			});
+			expect(parseTitleSlotFromContent(await Bun.file(file).text())).toMatchObject({
+				title: "ordinary still pending",
+				source: "user",
+			});
+		} finally {
+			metadataRelease.resolve();
+			ordinaryRelease.resolve();
+			await first;
+			await ordinary;
+			await manager.close();
+			await harness.agent.dispose();
+		}
+	});
+
+	it("never acknowledges a failed live title slot from memory on later reads or identical writes", async () => {
+		const harness = await createHarness();
+		const failure = new Error("single failed live title slot");
+		let attempts = 0;
+		class FailOnceLiveTitleStorage extends FileSessionStorage {
+			override async updateSessionTitle(file: string, update: SessionTitleUpdate): Promise<void> {
+				attempts++;
+				if (attempts === 1) throw failure;
+				await super.updateSessionTitle(file, update);
+			}
+		}
+		const manager = SessionManager.create(harness.cwdA, undefined, new FailOnceLiveTitleStorage());
+		await manager.ensureOnDisk();
+		const file = manager.getSessionFile()!;
+		const sessionId = manager.getSessionId();
+		const request = { title: "unconfirmed title", source: "user" as const, expectedTitle: "" };
+		try {
+			await expect(manager.accessSessionTitle(request)).rejects.toThrow(failure.message);
+			expect(manager.getSessionName()).toBe("unconfirmed title");
+			expect(parseTitleSlotFromContent(await Bun.file(file).text())?.title).toBe("");
+			for (const later of [
+				{},
+				request,
+				{ title: "unconfirmed title", source: "user" as const },
+				{ title: "unconfirmed title", onlyIfEmpty: true },
+			]) {
+				await expect(manager.accessSessionTitle(later)).rejects.toThrow(failure.message);
+			}
+			expect(attempts).toBe(1);
+			expect(manager.getSessionId()).toBe(sessionId);
+			expect(manager.getSessionFile()).toBe(file);
+			expect(parseTitleSlotFromContent(await Bun.file(file).text())?.title).toBe("");
+		} finally {
+			await manager.close().catch(error => {
+				if (error !== failure) throw error;
+			});
+			await harness.agent.dispose();
+		}
+	});
+
+	for (const operation of ["load", "resume"] as const) {
+		it(`coordinates cold title persistence with concurrent ${operation} and preserves a later native user rename`, async () => {
+			const harness = await createHarness();
+			const seed = SessionManager.create(harness.cwdA);
+			await seed.ensureOnDisk();
+			seed.appendMessage({ role: "user", content: "keep native chat", timestamp: 1 });
+			seed.appendMessage(makeAssistantMessage("keep native reply"));
+			const sessionId = seed.getSessionId();
+			const file = seed.getSessionFile()!;
+			await seed.close();
+			const searchEntered = Promise.withResolvers<void>();
+			const searchRelease = Promise.withResolvers<void>();
+			let searches = 0;
+			let coldUncommitted = true;
+			const originalList = SessionManager.list;
+			const listing = spyOn(SessionManager, "list").mockImplementation(
+				async (...args: Parameters<typeof SessionManager.list>) => {
+					if (++searches === 1) {
+						searchEntered.resolve();
+						await searchRelease.promise;
+					} else if (coldUncommitted) {
+						throw new Error("Session initialization overlapped an uncommitted cold title");
+					}
+					return originalList(...args);
+				},
+			);
+			const originalUpdate = FileSessionStorage.prototype.updateSessionTitle;
+			const updating = spyOn(FileSessionStorage.prototype, "updateSessionTitle").mockImplementation(async function (
+				this: FileSessionStorage,
+				target: string,
+				update: SessionTitleUpdate,
+			): Promise<void> {
+				await originalUpdate.call(this, target, update);
+				if (target === file && update.title === "cold automatic") coldUncommitted = false;
+			});
+			const cold = harness.agent.extMethod("_omp/session/title", {
+				sessionId,
+				cwd: harness.cwdA,
+				title: "cold automatic",
+				onlyIfEmpty: true,
+			});
+			let manual: Promise<void> | undefined;
+			try {
+				await searchEntered.promise;
+				const params = { sessionId, cwd: harness.cwdA, mcpServers: [] };
+				const loaded =
+					operation === "load" ? harness.agent.loadSession(params) : harness.agent.resumeSession(params);
+				manual = loaded.then(async () => {
+					const session = harness.findSession(sessionId)!;
+					expect(session.sessionManager.getSessionName()).toBe("cold automatic");
+					await session.sessionManager.setSessionName("native user rename", "user");
+				});
+				searchRelease.resolve();
+				const [result] = await Promise.all([cold, manual]);
+				expect(result).toMatchObject({ sessionId, title: "cold automatic", source: "auto", status: "updated" });
+				expect(
+					await harness.agent.extMethod("_omp/session/title", {
+						sessionId,
+						cwd: harness.cwdA,
+						title: "delayed auto",
+						onlyIfEmpty: true,
+					}),
+				).toMatchObject({ sessionId, title: "native user rename", source: "user", status: "kept" });
+				expect(parseTitleSlotFromContent(await Bun.file(file).text())).toMatchObject({
+					title: "native user rename",
+					source: "user",
+				});
+				expect(harness.findSession(sessionId)!.sessionManager.getSessionId()).toBe(sessionId);
+			} finally {
+				searchRelease.resolve();
+				await Promise.allSettled([cold, manual]);
+				listing.mockRestore();
+				updating.mockRestore();
+				await harness.agent.dispose();
+			}
+		});
+	}
+
+	it("cleans slot-truncation whitespace consistently for live and cold titles, idempotence, and CAS", async () => {
+		const harness = await createHarness();
+		const { sessionId } = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const file = harness.findSession(sessionId)!.sessionManager.getSessionFile()!;
+		const params = { sessionId, cwd: harness.cwdA };
+		const title = `${"a".repeat(157)} b`;
+		try {
+			const first = await harness.agent.extMethod("_omp/session/title", { ...params, title });
+			const persisted = first.title as string;
+			expect(first.status).toBe("updated");
+			expect(persisted).toBe(persisted.trim());
+			expect(persisted.length).toBeLessThan(title.length);
+			expect(title.startsWith(persisted)).toBe(true);
+			expect(parseTitleSlotFromContent(await Bun.file(file).text())?.title).toBe(persisted);
+			const body = await Bun.file(file).text();
+			expect((await harness.agent.extMethod("_omp/session/title", { ...params, title })).status).toBe("unchanged");
+			expect(await Bun.file(file).text()).toBe(body);
+			await harness.agent.closeSession({ sessionId });
+			expect((await harness.agent.extMethod("_omp/session/title", { ...params, title })).status).toBe("unchanged");
+			expect(await Bun.file(file).text()).toBe(body);
+			expect(
+				(
+					await harness.agent.extMethod("_omp/session/title", {
+						...params,
+						title: "CAS after truncation",
+						expectedTitle: persisted,
+					})
+				).status,
+			).toBe("updated");
+			expect(
+				(
+					await harness.agent.extMethod("_omp/session/title", {
+						...params,
+						title: "stale",
+						expectedTitle: persisted,
+					})
+				).status,
+			).toBe("conflict");
+			expect(
+				(
+					await harness.agent.extMethod("_omp/session/title", {
+						...params,
+						title,
+						expectedTitle: "CAS after truncation",
+					})
+				).title,
+			).toBe(persisted);
+			expect(
+				(
+					await harness.agent.extMethod("_omp/session/title", {
+						...params,
+						title,
+						expectedTitle: persisted,
+					})
+				).status,
+			).toBe("unchanged");
+		} finally {
+			await harness.agent.dispose();
+		}
+	});
+
+	it("refuses a metadata hot append after the loaded journal is deleted without creating a headerless replacement", async () => {
+		const harness = await createHarness();
+		const seed = SessionManager.create(harness.cwdA);
+		await seed.ensureOnDisk();
+		seed.appendMessage({ role: "user", content: "must not be lost", timestamp: 1 });
+		seed.appendMessage(makeAssistantMessage("native chat"));
+		const file = seed.getSessionFile()!;
+		const sessionId = seed.getSessionId();
+		await seed.close();
+		const manager = await SessionManager.open(file, undefined, undefined, {
+			suppressBreadcrumb: true,
+			throwIfMissing: true,
+		});
+		await fs.promises.unlink(file);
+		try {
+			await expect(manager.accessSessionTitle({ title: "must not recreate" })).rejects.toThrow(
+				"journal disappeared",
+			);
+			expect(await Bun.file(file).exists()).toBe(false);
+			expect(manager.getSessionId()).toBe(sessionId);
+			expect(manager.getSessionFile()).toBe(file);
+			await expect(manager.accessSessionTitle({})).rejects.toThrow("journal disappeared");
+		} finally {
+			await manager.close().catch(error => {
+				if (!(error instanceof Error) || !error.message.includes("journal disappeared")) throw error;
+			});
+			await harness.agent.dispose();
+		}
+	});
+
+	it("confirms a successful legacy metadata rewrite superseded by a synchronous chat publish without latching a failure", async () => {
+		const harness = await createHarness();
+		const seed = SessionManager.create(harness.cwdA);
+		await seed.ensureOnDisk();
+		seed.appendMessage({ role: "user", content: "before legacy rewrite", timestamp: 1 });
+		const file = seed.getSessionFile()!;
+		const sessionId = seed.getSessionId();
+		await seed.close();
+		const modern = await Bun.file(file).text();
+		await Bun.write(file, modern.slice(modern.indexOf("\n") + 1));
+		const rewriteEntered = Promise.withResolvers<void>();
+		const rewriteRelease = Promise.withResolvers<void>();
+		let blocked = false;
+		class ControlledLegacyRewriteStorage extends FileSessionStorage {
+			override async writeLinesAtomic(
+				target: string,
+				lines: readonly string[],
+				options?: WriteTextAtomicOptions,
+			): Promise<void> {
+				if (!blocked && target === file) {
+					blocked = true;
+					rewriteEntered.resolve();
+					await rewriteRelease.promise;
+				}
+				await super.writeLinesAtomic(target, lines, options);
+			}
+		}
+		const manager = await SessionManager.open(file, undefined, new ControlledLegacyRewriteStorage(), {
+			suppressBreadcrumb: true,
+			throwIfMissing: true,
+		});
+		const mutation = manager.accessSessionTitle({ title: "legacy committed", expectedTitle: "" });
+		try {
+			await rewriteEntered.promise;
+			manager.appendMessage({ role: "user", content: "arrived during legacy rewrite", timestamp: 2 });
+			rewriteRelease.resolve();
+			expect(await mutation).toMatchObject({
+				sessionId,
+				title: "legacy committed",
+				source: "auto",
+				status: "updated",
+			});
+			await manager.flush();
+			expect(await manager.accessSessionTitle({})).toMatchObject({
+				sessionId,
+				title: "legacy committed",
+				status: "unchanged",
+			});
+			const body = await Bun.file(file).text();
+			expect(parseTitleSlotFromContent(body)).toMatchObject({ title: "legacy committed", source: "auto" });
+			expect(body).toContain("arrived during legacy rewrite");
+			expect(body).toContain("before legacy rewrite");
+			expect(manager.getSessionId()).toBe(sessionId);
+			expect(manager.getSessionFile()).toBe(file);
+		} finally {
+			rewriteRelease.resolve();
+			await Promise.allSettled([mutation]);
+			await manager.close();
+			await harness.agent.dispose();
+		}
+	});
+
+	it("returns busy immediately at the ACP layer during a live title write without queueing behind a slow notification", async () => {
+		const notificationEntered = Promise.withResolvers<void>();
+		const notificationRelease = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			sessionUpdateHook: async notification => {
+				if (
+					notification.update.sessionUpdate === "session_info_update" &&
+					notification.update.title === "slow ACP metadata"
+				) {
+					notificationEntered.resolve();
+					await notificationRelease.promise;
+				}
+			},
+		});
+		vi.useFakeTimers();
+		const { sessionId } = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const file = harness.findSession(sessionId)!.sessionManager.getSessionFile()!;
+		const writeEntered = Promise.withResolvers<void>();
+		const writeRelease = Promise.withResolvers<void>();
+		const originalUpdate = FileSessionStorage.prototype.updateSessionTitle;
+		const writing = spyOn(FileSessionStorage.prototype, "updateSessionTitle").mockImplementation(async function (
+			this: FileSessionStorage,
+			target: string,
+			update: SessionTitleUpdate,
+		): Promise<void> {
+			if (target === file && update.title === "slow ACP metadata") {
+				writeEntered.resolve();
+				await writeRelease.promise;
+			}
+			await originalUpdate.call(this, target, update);
+		});
+		const params = { sessionId, cwd: harness.cwdA };
+		const first = harness.agent.extMethod("_omp/session/title", {
+			...params,
+			title: "slow ACP metadata",
+			expectedTitle: "",
+		});
+		try {
+			await writeEntered.promise;
+			const concurrent = await Promise.all([
+				harness.agent.extMethod("_omp/session/title", params),
+				harness.agent.extMethod("_omp/session/title", { ...params, title: "parallel ACP metadata" }),
+			]);
+			expect(concurrent.map(result => result.status)).toEqual(["busy", "busy"]);
+			expect(parseTitleSlotFromContent(await Bun.file(file).text())?.title).toBe("");
+			writeRelease.resolve();
+			await notificationEntered.promise;
+			// The native mutation is committed now, even though notification delivery is blocked.
+			expect(await harness.agent.extMethod("_omp/session/title", params)).toMatchObject({
+				sessionId,
+				title: "slow ACP metadata",
+				source: "auto",
+				status: "unchanged",
+			});
+			expect(
+				(
+					await harness.agent.extMethod("_omp/session/title", {
+						...params,
+						title: "slow ACP metadata",
+						expectedTitle: "slow ACP metadata",
+					})
+				).status,
+			).toBe("unchanged");
+			notificationRelease.resolve();
+			expect((await first).status).toBe("updated");
+		} finally {
+			writeRelease.resolve();
+			notificationRelease.resolve();
+			await Promise.allSettled([first]);
+			writing.mockRestore();
+			await harness.agent.dispose();
+			vi.useRealTimers();
+		}
+	});
+
+	for (const mismatch of ["none", "title", "source", "timestamp", "order"] as const) {
+		it(`confirms ordered later user renames during legacy metadata supersession and rejects ${mismatch} slot mismatches`, async () => {
+			const harness = await createHarness();
+			const seed = SessionManager.create(harness.cwdA);
+			await seed.ensureOnDisk();
+			seed.appendMessage({ role: "user", content: "chat before ordered renames", timestamp: 1 });
+			const file = seed.getSessionFile()!;
+			const sessionId = seed.getSessionId();
+			await seed.close();
+			const modern = await Bun.file(file).text();
+			await Bun.write(file, modern.slice(modern.indexOf("\n") + 1));
+			const rewriteEntered = Promise.withResolvers<void>();
+			const rewriteRelease = Promise.withResolvers<void>();
+			let blocked = false;
+			class OrderedLegacyRewriteStorage extends FileSessionStorage {
+				override async writeLinesAtomic(
+					target: string,
+					lines: readonly string[],
+					options?: WriteTextAtomicOptions,
+				): Promise<void> {
+					if (!blocked && target === file) {
+						blocked = true;
+						rewriteEntered.resolve();
+						await rewriteRelease.promise;
+					}
+					await super.writeLinesAtomic(target, lines, options);
+				}
+			}
+			const manager = await SessionManager.open(file, undefined, new OrderedLegacyRewriteStorage(), {
+				suppressBreadcrumb: true,
+				throwIfMissing: true,
+			});
+			const mutation = manager.accessSessionTitle({ title: "metadata A", expectedTitle: "" });
+			let rename: Promise<boolean> | undefined;
+			try {
+				await rewriteEntered.promise;
+				const userTitle = "原生用户标题😀 ".repeat(24).trim();
+				rename = manager.setSessionName(userTitle, "user");
+				manager.appendMessage({ role: "user", content: "chat publishes A and B", timestamp: 2 });
+				const titleEntries = manager.getEntries().filter(entry => entry.type === "title_change");
+				const entryA = titleEntries.find(entry => entry.title === "metadata A")!;
+				const entryB = titleEntries.at(-1)!;
+				expect(titleEntries.indexOf(entryB)).toBeGreaterThan(titleEntries.indexOf(entryA));
+				const expectedB = parseTitleSlotFromContent(
+					serializeTitleSlot({
+						title: userTitle,
+						source: "user",
+						updatedAt: entryB.timestamp,
+					}),
+				)!;
+				const actual = parseTitleSlotFromContent(await Bun.file(file).text())!;
+				expect(actual).toEqual(expectedB);
+				if (mismatch !== "none") {
+					const forged: SessionTitleUpdate = {
+						title: actual.title,
+						source: actual.source,
+						updatedAt: actual.updatedAt,
+					};
+					if (mismatch === "title") forged.title = "unrelated slot";
+					if (mismatch === "source") forged.source = "auto";
+					if (mismatch === "timestamp") forged.updatedAt = "2000-01-01T00:00:00.000Z";
+					if (mismatch === "order") {
+						forged.title = entryA.title;
+						forged.source = entryA.source;
+						forged.updatedAt = entryA.timestamp;
+					}
+					await new FileSessionStorage().updateSessionTitle(file, forged);
+				}
+				rewriteRelease.resolve();
+				if (mismatch === "none") {
+					expect(await mutation).toEqual({ sessionId, title: "metadata A", source: "auto", status: "updated" });
+					expect(await rename).toBe(true);
+					await manager.flush();
+					expect((await manager.accessSessionTitle({})).source).toBe("user");
+					expect(parseTitleSlotFromContent(await Bun.file(file).text())).toEqual(expectedB);
+				} else {
+					await expect(mutation).rejects.toThrow("metadata rewrite was not committed");
+					await expect(manager.accessSessionTitle({})).rejects.toThrow("metadata rewrite was not committed");
+				}
+				const body = await Bun.file(file).text();
+				expect(body).toContain("chat before ordered renames");
+				expect(body).toContain("chat publishes A and B");
+				expect(manager.getSessionId()).toBe(sessionId);
+				expect(manager.getSessionFile()).toBe(file);
+			} finally {
+				rewriteRelease.resolve();
+				await Promise.allSettled([mutation, rename]);
+				await manager.close().catch(error => {
+					if (
+						mismatch === "none" ||
+						!(error instanceof Error) ||
+						!error.message.includes("metadata rewrite was not committed")
+					)
+						throw error;
+				});
+				await harness.agent.dispose();
+			}
+		});
+	}
+
+	for (const format of ["legacy", "live-legacy", "slotted"] as const) {
+		it(`preserves original invalid UTF-8 chat bytes when accessing ${format} title metadata`, async () => {
+			const harness = await createHarness();
+			const seed = SessionManager.create(harness.cwdA);
+			await seed.ensureOnDisk();
+			seed.appendMessage({ role: "user", content: "保留🚚 INVALID_UTF8_MARKER", timestamp: 1 });
+			seed.appendMessage(makeAssistantMessage("unchanged native reply"));
+			const file = seed.getSessionFile()!;
+			const sessionId = seed.getSessionId();
+			await seed.close();
+			const modern = await fs.promises.readFile(file);
+			const slotBytes = modern.indexOf(0x0a) + 1;
+			const body = modern.subarray(slotBytes);
+			const marker = Buffer.from("INVALID_UTF8_MARKER", "utf8");
+			const markerOffset = body.indexOf(marker);
+			expect(markerOffset).toBeGreaterThanOrEqual(0);
+			const corruptBody = Buffer.concat([
+				body.subarray(0, markerOffset),
+				Buffer.from([0xff]),
+				body.subarray(markerOffset + marker.length),
+			]);
+			const original =
+				format === "slotted" ? Buffer.concat([modern.subarray(0, slotBytes), corruptBody]) : corruptBody;
+			await Bun.write(file, original);
+			const liveLegacy =
+				format === "live-legacy"
+					? await SessionManager.open(file, undefined, undefined, {
+							suppressBreadcrumb: true,
+							throwIfMissing: true,
+						})
+					: undefined;
+			const strictRead = spyOn(FileSessionStorage.prototype, "readTextStrictUtf8");
+			try {
+				const request = {
+					sessionId,
+					cwd: harness.cwdA,
+					title: "UTF8 metadata",
+					expectedTitle: "",
+					onlyIfEmpty: true,
+				};
+				if (format !== "slotted") {
+					const mutation = liveLegacy
+						? liveLegacy.accessSessionTitle(request)
+						: harness.agent.extMethod("_omp/session/title", request);
+					await expect(mutation).rejects.toThrow("invalid UTF-8");
+					if (liveLegacy) expect(liveLegacy.getSessionId()).toBe(sessionId);
+					expect(strictRead).toHaveBeenCalledTimes(1);
+					expect(await fs.promises.readFile(file)).toEqual(original);
+				} else {
+					expect(await harness.agent.extMethod("_omp/session/title", request)).toMatchObject({
+						sessionId,
+						title: "UTF8 metadata",
+						source: "auto",
+						status: "updated",
+					});
+					expect(strictRead).not.toHaveBeenCalled();
+					const after = await fs.promises.readFile(file);
+					expect(after.subarray(slotBytes, slotBytes + corruptBody.length)).toEqual(corruptBody);
+					expect(parseTitleSlotFromContent(after.subarray(0, slotBytes).toString("utf8"))?.title).toBe(
+						"UTF8 metadata",
+					);
+				}
+				const after = await fs.promises.readFile(file);
+				expect(after.includes(0xff)).toBe(true);
+				expect(after.includes(Buffer.from([0xef, 0xbf, 0xbd]))).toBe(false);
+				const sessions = await SessionManager.list(harness.cwdA);
+				expect(sessions.map(session => session.id)).toEqual([sessionId]);
+				expect(sessions[0]?.path).toBe(file);
+			} finally {
+				strictRead.mockRestore();
+				if (liveLegacy) {
+					await liveLegacy.close().catch(error => {
+						if (!(error instanceof Error) || !error.message.includes("invalid UTF-8")) throw error;
+					});
+				}
+				await harness.agent.dispose();
+			}
+		});
+	}
 
 	it("accepts OMP extension methods and rejects unknown unprefixed methods", async () => {
 		const harness = await createHarness();

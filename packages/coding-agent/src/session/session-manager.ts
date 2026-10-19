@@ -97,6 +97,7 @@ import {
 	resolveBlobRefsInEntriesSync,
 	type SessionLoadResult,
 	visitEntriesFromFile,
+	visitEntriesFromFileStream,
 } from "./session-loader";
 import { generateId, migrateToCurrentVersion } from "./session-migrations";
 import {
@@ -116,7 +117,7 @@ import {
 	type SessionStorageWriter,
 	SessionWriteConflictError,
 } from "./session-storage";
-import { type SessionTitleUpdate, serializeTitleSlot } from "./session-title-slot";
+import { parseTitleSlotFromContent, type SessionTitleUpdate, serializeTitleSlot } from "./session-title-slot";
 import {
 	additionalWorkspaceDirectories,
 	normalizeSessionWorkspace,
@@ -133,6 +134,21 @@ const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
  * inside every read-to-publish window exhausts them.
  */
 const MAX_WRITE_CONFLICT_RECOVERIES = 3;
+
+/** Conditional, metadata-only title access. An omitted title is a read. */
+export interface SessionTitleRequest {
+	title?: string;
+	expectedTitle?: string;
+	onlyIfEmpty?: boolean;
+	source?: SessionTitleSource;
+}
+
+export interface SessionTitleResult {
+	sessionId: string;
+	title: string;
+	source?: SessionTitleSource;
+	status: "updated" | "unchanged" | "kept" | "conflict" | "busy" | "not_found";
+}
 
 /** A fresh session id. */
 export function mintSessionId(): string {
@@ -901,6 +917,7 @@ export class SessionManager {
 	#sessionName: string | undefined;
 	#titleSource: SessionTitleSource | undefined;
 	#titleRevision = 0;
+	#pendingTitleWrites = 0;
 	/** Bumped by in-place entry updates, which a {@link SessionBodyStamp} cannot otherwise see. */
 	#bodyRevision = 0;
 	#sessionFile: string | undefined;
@@ -1122,6 +1139,21 @@ export class SessionManager {
 		this.#claimSession();
 		const claim = this.#sessionClaim;
 		return claim !== undefined && claim.sessionId === this.#sessionId && claim.release === undefined;
+	}
+
+	/** Never treats an ordinary manager's unlocked fallback callback as ownership proof. */
+	#claimMetadataOwnership(): (() => void) | null {
+		if (!this.#persist) return () => {};
+		if (!this.#sessionFile || !(this.#storage instanceof FileSessionStorage)) {
+			throw new Error("Native metadata ownership is unavailable for this session storage");
+		}
+		return this.#storage.claimSessionForMetadata(this.#sessionId, this.#sessionFile, true);
+	}
+
+	#assertMetadataOwnership(): void {
+		const release = this.#claimMetadataOwnership();
+		if (!release) throw new Error("Session ownership changed during metadata mutation");
+		release();
 	}
 
 	/**
@@ -1747,7 +1779,7 @@ export class SessionManager {
 	 * moved so callers skip current-marking updates; a body that landed before
 	 * that change still advances the durable byte record after readback.
 	 */
-	async #runFencedAtomicRewrite(epoch: number): Promise<boolean> {
+	async #runFencedAtomicRewrite(epoch: number, preserveIdentity = false): Promise<boolean> {
 		if (this.#released) return false;
 		this.#atomicRewriteFenceEpoch = epoch;
 		let recoveries = 0;
@@ -1755,7 +1787,11 @@ export class SessionManager {
 			do {
 				this.#atomicRewriteDirty = false;
 				await this.#closeWriterHandle();
-				if (this.#sessionOwnedElsewhere()) this.#moveOffSessionFile("open-elsewhere");
+				if (preserveIdentity) {
+					this.#assertMetadataOwnership();
+				} else if (this.#sessionOwnedElsewhere()) {
+					this.#moveOffSessionFile("open-elsewhere");
+				}
 				const sessionFile = this.#sessionFile;
 				if (!sessionFile) return false;
 				if (this.#diskEpoch !== epoch) return false;
@@ -1769,7 +1805,7 @@ export class SessionManager {
 						? this.#storage.writeLinesAtomic(sessionFile, body.lines, options)
 						: this.#storage.writeTextAtomic(sessionFile, body.lines.join(""), options));
 				} catch (error) {
-					if (await this.#recoverFromWriteConflict(error, recoveries)) {
+					if (!preserveIdentity && (await this.#recoverFromWriteConflict(error, recoveries))) {
 						recoveries++;
 						// Publish the whole transcript against what the recovery found on the next pass.
 						this.#atomicRewriteDirty = true;
@@ -1917,8 +1953,126 @@ export class SessionManager {
 		}
 	}
 
-	async #persistTitleChangeEntry(entry: TitleChangeEntry, update: SessionTitleUpdate): Promise<void> {
+	/** A synchronous publish may supersede our fenced rewrite while preserving this exact mutation. */
+	async #confirmMetadataRewrite(
+		sessionFile: string,
+		sessionId: string,
+		entry: TitleChangeEntry,
+		update: SessionTitleUpdate,
+	): Promise<void> {
+		await this.#storage.drain();
+		let sawHeader = false;
+		let validHeader = false;
+		let foundEntry = false;
+		let latestCommittedTitle = update;
+		const slot = await visitEntriesFromFileStream(
+			sessionFile,
+			candidate => {
+				if (!sawHeader) {
+					sawHeader = true;
+					validHeader = candidate.type === "session" && candidate.id === sessionId;
+					return;
+				}
+				if (candidate.type === TITLE_CHANGE_ENTRY_TYPE && candidate.id === entry.id) {
+					foundEntry =
+						candidate.title === entry.title &&
+						candidate.source === entry.source &&
+						candidate.parentId === entry.parentId &&
+						candidate.timestamp === entry.timestamp &&
+						candidate.previousTitle === entry.previousTitle &&
+						candidate.trigger === entry.trigger;
+				}
+				// Only title records at or after this exact mutation may explain a newer slot.
+				if (foundEntry && candidate.type === TITLE_CHANGE_ENTRY_TYPE) {
+					if (
+						typeof candidate.title !== "string" ||
+						!SessionManager.#cleanTitle(candidate.title) ||
+						typeof candidate.timestamp !== "string" ||
+						(candidate.source !== "auto" && candidate.source !== "user")
+					) {
+						throw new Error("Metadata rewrite publication contains an invalid subsequent title");
+					}
+					latestCommittedTitle = {
+						title: SessionManager.#cleanTitle(candidate.title),
+						source: candidate.source,
+						updatedAt: candidate.timestamp,
+					};
+				}
+			},
+			{
+				throwIfMissing: true,
+				onMalformedRecord: () => {
+					throw new Error("Metadata rewrite publication contains malformed records");
+				},
+			},
+		);
+		if (this.#diskFailure) throw this.#diskFailure;
+		// Ordinary renames clean before native slot truncation; retain that exact semantic,
+		// including UTF-8 capacity, source and timestamp, for the last ordered title record.
+		const expectedSlot = parseTitleSlotFromContent(serializeTitleSlot(latestCommittedTitle))!;
+		if (
+			this.#released ||
+			this.#sessionFile !== sessionFile ||
+			this.#sessionId !== sessionId ||
+			!validHeader ||
+			!foundEntry ||
+			slot?.title !== expectedSlot.title ||
+			slot?.source !== expectedSlot.source ||
+			slot?.updatedAt !== expectedSlot.updatedAt
+		) {
+			throw new Error("Session metadata rewrite was not committed to the requested identity");
+		}
+		this.#assertMetadataOwnership();
+	}
+
+	async #persistTitleChangeEntry(
+		entry: TitleChangeEntry,
+		update: SessionTitleUpdate,
+		preserveIdentity = false,
+	): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
+		if (preserveIdentity) {
+			const sessionFile = this.#sessionFile;
+			const sessionId = this.#sessionId;
+			const line = this.#lineFor(entry);
+			// A pending body rewrite may already include this newly journaled entry.
+			// Capture its state before joining the disk queue to avoid appending it twice.
+			const needsRewrite =
+				!this.#fileIsCurrent ||
+				this.#rewriteRequired ||
+				!this.#hasTitleSlot ||
+				this.#atomicRewriteFenceEpoch === this.#diskEpoch;
+			await this.#scheduleDiskWork(
+				async () => {
+					if (this.#released || this.#sessionFile !== sessionFile || this.#sessionId !== sessionId) {
+						throw new Error("Session changed during metadata mutation");
+					}
+					this.#assertMetadataOwnership();
+					if (needsRewrite || !this.#fileIsCurrent || this.#rewriteRequired || !this.#hasTitleSlot) {
+						if (!this.#hasTitleSlot && this.#storage instanceof FileSessionStorage) {
+							await this.#storage.readTextStrictUtf8(sessionFile);
+						}
+						if (!(await this.#runFencedAtomicRewrite(this.#diskEpoch, true))) {
+							await this.#confirmMetadataRewrite(sessionFile, sessionId, entry, update);
+						}
+						this.#fileIsCurrent = true;
+						this.#rewriteRequired = false;
+						this.#hasTitleSlot = true;
+						await this.#storage.drain();
+						return;
+					}
+					if (!this.#storage.existsSync(sessionFile)) {
+						throw new Error("Session journal disappeared before metadata append");
+					}
+					await this.#appendWriter().append(line);
+					this.#recordDurableAppend(line);
+					await this.#storage.updateSessionTitle(sessionFile, update);
+					await this.#storage.drain();
+				},
+				{ ignoreEpoch: true },
+			);
+			return;
+		}
 		if (this.#diskFailure) {
 			this.#fileIsCurrent = false;
 			this.#rewriteRequired = true;
@@ -3289,6 +3443,68 @@ export class SessionManager {
 		return this.#sessionName;
 	}
 
+	/** Access this exact manager without entering any turn, model, or resume lifecycle. */
+	async accessSessionTitle(request: SessionTitleRequest): Promise<SessionTitleResult> {
+		if (this.#diskFailure) throw this.#diskFailure;
+		const current = this.#sessionTitleResult();
+		if (this.#released || this.#sessionFileRelocating || this.#pendingTitleWrites > 0) {
+			return { ...current, status: "busy" };
+		}
+		const release = this.#claimMetadataOwnership();
+		if (!release) return { ...current, status: "busy" };
+		try {
+			const status = SessionManager.#titleAccessStatus(current.title, current.source, request);
+			if (status !== "updated") return { ...current, status };
+			// Never repair malformed retained history as a side effect of a metadata request.
+			if (this.#loadedMalformedRecords > 0) throw new Error("Session contains malformed history records");
+			const committed: SessionTitleResult = {
+				sessionId: current.sessionId,
+				title: SessionManager.#metadataTitle(request.title!, request.source),
+				source: request.source ?? "auto",
+				status: "updated",
+			};
+			await this.#setSessionName(committed.title, committed.source!, undefined, true);
+			if (this.#sessionId !== committed.sessionId)
+				throw new Error("Session identity changed during metadata mutation");
+			return committed;
+		} finally {
+			release();
+		}
+	}
+
+	#sessionTitleResult(status: SessionTitleResult["status"] = "unchanged"): SessionTitleResult {
+		return { sessionId: this.#sessionId, title: this.#sessionName ?? "", source: this.#titleSource, status };
+	}
+
+	static #titleAccessStatus(
+		title: string,
+		source: SessionTitleSource | undefined,
+		request: SessionTitleRequest,
+	): SessionTitleResult["status"] {
+		if (request.title === undefined) return "unchanged";
+		if (!SessionManager.#cleanTitle(request.title)) throw new Error("Session title must not be empty");
+		if (request.expectedTitle !== undefined && request.expectedTitle !== title) return "conflict";
+		if ((request.onlyIfEmpty && title !== "") || (source === "user" && request.source !== "user")) return "kept";
+		if (
+			SessionManager.#metadataTitle(request.title, request.source) === title &&
+			(request.source ?? "auto") === source
+		)
+			return "unchanged";
+		return "updated";
+	}
+
+	static #metadataTitle(title: string, source: SessionTitleSource = "auto"): string {
+		return SessionManager.#cleanTitle(
+			parseTitleSlotFromContent(
+				serializeTitleSlot({
+					title: SessionManager.#cleanTitle(title),
+					source,
+					updatedAt: nowIso(),
+				}),
+			)!.title,
+		);
+	}
+
 	onSessionNameChanged(cb: () => void): () => void {
 		this.#sessionNameChangedCallbacks.add(cb);
 		return () => {
@@ -3334,6 +3550,15 @@ export class SessionManager {
 	 *   Auto titles are ignored once the user has set a name.
 	 */
 	async setSessionName(name: string, source: SessionTitleSource = "auto", trigger?: string): Promise<boolean> {
+		return this.#setSessionName(name, source, trigger);
+	}
+
+	async #setSessionName(
+		name: string,
+		source: SessionTitleSource,
+		trigger?: string,
+		preserveIdentity = false,
+	): Promise<boolean> {
 		if (this.#released) return false;
 		if (this.#titleSource === "user" && source === "auto") return false;
 
@@ -3360,16 +3585,21 @@ export class SessionManager {
 		if (trigger) entry.trigger = trigger;
 		this.#entries.push(entry);
 		this.#index.insert(entry);
+		this.#pendingTitleWrites++;
 		this.#notifyEntryAppended(entry);
-		await this.#persistTitleChangeEntry(entry, { title, source, updatedAt: timestamp });
-		// Keep the recent-sessions title index current so welcome-screen lookups
-		// never have to content-scan this session's file.
-		if (this.#persist && this.#storage instanceof FileSessionStorage) {
-			recordSessionTitle(this.#sessionId, title);
-		}
+		try {
+			await this.#persistTitleChangeEntry(entry, { title, source, updatedAt: timestamp }, preserveIdentity);
+			// Keep the recent-sessions title index current so welcome-screen lookups
+			// never have to content-scan this session's file.
+			if (this.#persist && this.#storage instanceof FileSessionStorage) {
+				recordSessionTitle(this.#sessionId, title);
+			}
 
-		this.#notifySessionNameListeners();
-		return true;
+			this.#notifySessionNameListeners();
+			return true;
+		} finally {
+			this.#pendingTitleWrites--;
+		}
 	}
 
 	/**
@@ -4182,6 +4412,138 @@ export class SessionManager {
 			history.push(entry);
 			parentId = id;
 		}
+	}
+
+	/**
+	 * Edit a cold journal under its native ownership lease, without constructing a
+	 * manager, resolving message blobs, or starting an AgentSession. No ID fallback.
+	 */
+	static async accessStoredSessionTitle(
+		filePath: string,
+		sessionId: string,
+		cwd: string,
+		request: SessionTitleRequest,
+		storage: FileSessionStorage = new FileSessionStorage(),
+	): Promise<SessionTitleResult> {
+		const missing: SessionTitleResult = { sessionId, title: "", status: "not_found" };
+		const release = storage.claimSessionForMetadata(sessionId, filePath);
+		if (!release) return { ...missing, status: "busy" };
+		let writing = false;
+		try {
+			const size = storage.statSync(filePath).size;
+			let prefixBytes = 4096;
+			let [prefix, suffix] = await storage.readTextSlices(filePath, prefixBytes, 32_768);
+			const slot = parseTitleSlotFromContent(prefix);
+			const headerOffset = slot ? prefix.indexOf("\n") + 1 : 0;
+			while (prefix.indexOf("\n", headerOffset) < 0 && prefixBytes < size) {
+				prefixBytes *= 2;
+				[prefix, suffix] = await storage.readTextSlices(filePath, prefixBytes, 32_768);
+			}
+			const headerEnd = prefix.indexOf("\n", headerOffset);
+			const header = JSON.parse(prefix.slice(headerOffset, headerEnd < 0 ? undefined : headerEnd)) as SessionHeader;
+			if (header.type !== "session" || header.id !== sessionId || typeof header.cwd !== "string") return missing;
+			const [actualCwd, requestedCwd] = await Promise.all([
+				fs.promises.realpath(header.cwd),
+				fs.promises.realpath(cwd),
+			]);
+			if (actualCwd !== requestedCwd) return missing;
+			const current: SessionTitleResult = {
+				sessionId,
+				title: slot ? slot.title : (header.title ?? ""),
+				source: slot ? slot.source : header.titleSource,
+				status: "unchanged",
+			};
+			const status = SessionManager.#titleAccessStatus(current.title, current.source, request);
+			if (status !== "updated") return { ...current, status };
+			writing = true;
+			const title = SessionManager.#metadataTitle(request.title!, request.source);
+			const source = request.source ?? "auto";
+			const timestamp = nowIso();
+			const entry: TitleChangeEntry = {
+				type: TITLE_CHANGE_ENTRY_TYPE,
+				id: Bun.randomUUIDv7(),
+				parentId: await SessionManager.#storedTitleParent(filePath, suffix, size),
+				timestamp,
+				runtime: currentRuntimeIdentity(),
+				title,
+				source,
+			};
+			if (current.title) entry.previousTitle = current.title;
+			const line = `${stringifyJson(entry)}\n`;
+			const update = { title, source, updatedAt: timestamp };
+			if (!slot) {
+				// Legacy files need a new reserved slot. Validate first, then preserve
+				// every original byte rather than reserializing their chat records.
+				const content = await storage.readTextStrictUtf8(filePath);
+				let offset = 0;
+				while (offset < content.length) {
+					const newline = content.indexOf("\n", offset);
+					const end = newline < 0 ? content.length : newline;
+					const record = content.slice(offset, end);
+					if (/[^\t\r ]/.test(record)) {
+						try {
+							JSON.parse(record);
+						} catch (cause) {
+							throw new Error("Legacy session contains malformed history records", { cause });
+						}
+					}
+					offset = end + 1;
+				}
+				await storage.writeTextAtomic(
+					filePath,
+					serializeTitleSlot(update) + content + (content.endsWith("\n") ? "" : "\n") + line,
+					{ expectedSize: size },
+				);
+			} else {
+				const writer = storage.openWriter(filePath);
+				try {
+					await writer.append((suffix.endsWith("\n") ? "" : "\n") + line);
+					await writer.flush();
+					await storage.updateSessionTitle(filePath, update);
+				} finally {
+					await writer.close();
+				}
+			}
+			await storage.drain();
+			// The fixed-width slot is the authority when a journal is next opened.
+			const persisted = parseTitleSlotFromContent(serializeTitleSlot(update))!;
+			recordSessionTitle(sessionId, persisted.title);
+			return { sessionId, title: persisted.title, source, status: "updated" };
+		} catch (error) {
+			if (!writing && isEnoent(error)) return missing;
+			throw error;
+		} finally {
+			release();
+		}
+	}
+
+	/** Most journals need only a tail window; oversized/invalid tails stream without retaining chat. */
+	static async #storedTitleParent(filePath: string, suffix: string, size: number): Promise<string | null> {
+		const lines = suffix.split("\n");
+		// A suffix starting in the middle of a JSON record must never become a candidate.
+		const first = Buffer.byteLength(suffix, "utf8") < size ? 1 : 0;
+		for (let index = lines.length - 1; index >= first; index--) {
+			try {
+				const entry = JSON.parse(lines[index]) as FileEntry;
+				if (entry.type === "session") return null;
+				if (typeof entry.id !== "string") continue;
+				if (entry.type === "model_usage" && entry.activeLeafId !== undefined) break;
+				return entry.id;
+			} catch {
+				/* The native loader also skips malformed records. */
+			}
+		}
+		let leaf: string | null = null;
+		let lastSelf: string | null = null;
+		const ids = new Set<string>();
+		await visitEntriesFromFileStream(filePath, entry => {
+			if (entry.type === "session" || typeof entry.id !== "string") return;
+			ids.add(entry.id);
+			const selected = sessionEntryLeafId(entry);
+			if (selected === entry.id) lastSelf = entry.id;
+			leaf = selected === null || ids.has(selected) ? selected : lastSelf;
+		});
+		return leaf;
 	}
 
 	/**

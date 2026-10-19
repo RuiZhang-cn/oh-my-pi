@@ -67,7 +67,7 @@ import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import type { UsageStatistics } from "../../session/session-entries";
 import type { SessionInfo as StoredSessionInfo } from "../../session/session-listing";
-import { SessionManager } from "../../session/session-manager";
+import { SessionManager, type SessionTitleRequest } from "../../session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands, toAcpAvailableCommands } from "../../slash-commands/available-commands";
 import { DEFAULT_STT_MODEL_KEY, STT_MODELS } from "../../stt/models";
@@ -615,6 +615,7 @@ export class AcpAgent implements Agent {
 	#initialSession: AgentSession | undefined;
 	#createSession: CreateAcpSession;
 	#sessions = new Map<string, ManagedSessionRecord>();
+	#sessionIdentityTails = new Map<string, Promise<void>>();
 	#disposePromise: Promise<void> | undefined;
 	#cleanupRegistered = false;
 	#clientCapabilities: ClientCapabilities | undefined;
@@ -660,6 +661,7 @@ export class AcpAgent implements Agent {
 			authMethods,
 			agentCapabilities: {
 				loadSession: true,
+				_meta: { "omp.sessionTitle": true },
 				mcpCapabilities: {
 					http: true,
 					sse: true,
@@ -1139,6 +1141,8 @@ export class AcpAgent implements Agent {
 
 	async extMethod(method: string, params: { [key: string]: unknown }): Promise<{ [key: string]: unknown }> {
 		switch (method) {
+			case "_omp/session/title":
+				return this.#accessSessionTitle(params);
 			case SPEECH_MODELS_LIST_METHOD:
 				return buildAcpSpeechModelsCatalog();
 			case "_omp/sessions/listAll": {
@@ -1256,57 +1260,140 @@ export class AcpAgent implements Agent {
 		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext);
 	}
 
-	async #loadManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
-		const existing = this.#sessions.get(sessionId);
-		if (existing) {
-			this.#assertMatchingCwd(existing.session, cwd);
-			await this.#configureMcpServers(existing, mcpServers);
-			return existing;
+	/** Coordinate cold snapshots with load/resume registration, never with prompt turns. */
+	async #withSessionIdentityLock<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+		const previous = this.#sessionIdentityTails.get(sessionId) ?? Promise.resolve();
+		const released = Promise.withResolvers<void>();
+		const tail = previous.catch(() => undefined).then(() => released.promise);
+		this.#sessionIdentityTails.set(sessionId, tail);
+		await previous.catch(() => undefined);
+		try {
+			return await operation();
+		} finally {
+			released.resolve();
+			if (this.#sessionIdentityTails.get(sessionId) === tail) this.#sessionIdentityTails.delete(sessionId);
 		}
+	}
 
-		const storedSession = await this.#findStoredSession(sessionId, cwd);
-		if (!storedSession) {
-			throw new Error(`ACP session not found: ${sessionId}`);
+	async #accessSessionTitle(params: { [key: string]: unknown }): Promise<{ [key: string]: unknown }> {
+		if (
+			typeof params.sessionId !== "string" ||
+			!params.sessionId ||
+			typeof params.cwd !== "string" ||
+			!path.isAbsolute(params.cwd) ||
+			(params.title !== undefined &&
+				(typeof params.title !== "string" || !params.title.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim())) ||
+			(params.expectedTitle !== undefined && typeof params.expectedTitle !== "string") ||
+			(params.onlyIfEmpty !== undefined && typeof params.onlyIfEmpty !== "boolean") ||
+			(params.source !== undefined && params.source !== "auto" && params.source !== "user")
+		) {
+			throw RequestError.invalidParams(undefined, "Expected a sessionId, absolute cwd, and valid title conditions");
 		}
-		return await this.#openStoredSession(storedSession.path, cwd, mcpServers, sessionId);
+		const sessionId = params.sessionId;
+		const cwd = params.cwd;
+		const request = {
+			title: params.title as string | undefined,
+			expectedTitle: params.expectedTitle as string | undefined,
+			onlyIfEmpty: params.onlyIfEmpty as boolean | undefined,
+			source: params.source as "auto" | "user" | undefined,
+		};
+		const live =
+			this.#sessions.get(sessionId)?.session ??
+			(this.#initialSession?.sessionId === sessionId ? this.#initialSession : undefined);
+		if (live) return this.#accessLiveSessionTitle(live, sessionId, cwd, request);
+		return this.#withSessionIdentityLock(sessionId, async () => {
+			const live =
+				this.#sessions.get(sessionId)?.session ??
+				(this.#initialSession?.sessionId === sessionId ? this.#initialSession : undefined);
+			if (live) {
+				return this.#accessLiveSessionTitle(live, sessionId, cwd, request);
+			}
+			const stored = await this.#findStoredSession(sessionId, cwd);
+			if (!stored) return { sessionId, title: "", status: "not_found" };
+			return { ...(await SessionManager.accessStoredSessionTitle(stored.path, sessionId, cwd, request)) };
+		});
+	}
+
+	async #accessLiveSessionTitle(
+		session: AgentSession,
+		sessionId: string,
+		cwd: string,
+		request: SessionTitleRequest,
+	): Promise<{ [key: string]: unknown }> {
+		const [actualCwd, requestedCwd] = await Promise.all([
+			fs.realpath(session.sessionManager.getCwd()),
+			fs.realpath(cwd),
+		]);
+		if (actualCwd !== requestedCwd || session.sessionManager.getSessionId() !== sessionId) {
+			return { sessionId, title: "", status: "not_found" };
+		}
+		const result = await session.sessionManager.accessSessionTitle(request);
+		if (result.status === "updated") {
+			await this.#connection.sessionUpdate({
+				sessionId,
+				update: { sessionUpdate: "session_info_update", title: result.title, updatedAt: new Date().toISOString() },
+			});
+		}
+		return { ...result };
+	}
+
+	async #loadManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
+		return this.#withSessionIdentityLock(sessionId, async () => {
+			const existing = this.#sessions.get(sessionId);
+			if (existing) {
+				this.#assertMatchingCwd(existing.session, cwd);
+				await this.#configureMcpServers(existing, mcpServers);
+				return existing;
+			}
+
+			const storedSession = await this.#findStoredSession(sessionId, cwd);
+			if (!storedSession) {
+				throw new Error(`ACP session not found: ${sessionId}`);
+			}
+			return await this.#openStoredSession(storedSession.path, cwd, mcpServers, sessionId);
+		});
 	}
 
 	async #resumeManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
-		const existing = this.#sessions.get(sessionId);
-		if (existing) {
-			this.#assertMatchingCwd(existing.session, cwd);
-			await this.#configureMcpServers(existing, mcpServers);
-			return existing;
-		}
+		return this.#withSessionIdentityLock(sessionId, async () => {
+			const existing = this.#sessions.get(sessionId);
+			if (existing) {
+				this.#assertMatchingCwd(existing.session, cwd);
+				await this.#configureMcpServers(existing, mcpServers);
+				return existing;
+			}
 
-		const storedSession = await this.#findStoredSession(sessionId, cwd);
-		if (!storedSession) {
-			throw new Error(`ACP session not found: ${sessionId}`);
-		}
-		return await this.#openStoredSession(storedSession.path, cwd, mcpServers, sessionId);
+			const storedSession = await this.#findStoredSession(sessionId, cwd);
+			if (!storedSession) {
+				throw new Error(`ACP session not found: ${sessionId}`);
+			}
+			return await this.#openStoredSession(storedSession.path, cwd, mcpServers, sessionId);
+		});
 	}
 
 	async #forkManagedSession(params: ForkSessionRequest): Promise<ManagedSessionRecord> {
-		const sourcePath = await this.#resolveForkSourceSessionPath(params.sessionId);
-		const { session, setToolUIContext } = normalizeCreatedAcpSession(
-			await this.#createSession(path.resolve(params.cwd), {
-				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
-			}),
-		);
-		try {
-			const success = await session.switchSession(sourcePath);
-			if (!success) {
-				throw new Error(`ACP session fork was cancelled: ${params.sessionId}`);
+		return this.#withSessionIdentityLock(params.sessionId, async () => {
+			const sourcePath = await this.#resolveForkSourceSessionPath(params.sessionId);
+			const { session, setToolUIContext } = normalizeCreatedAcpSession(
+				await this.#createSession(path.resolve(params.cwd), {
+					interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
+				}),
+			);
+			try {
+				const success = await session.switchSession(sourcePath);
+				if (!success) {
+					throw new Error(`ACP session fork was cancelled: ${params.sessionId}`);
+				}
+				const forked = await session.fork();
+				if (!forked) {
+					throw new Error(`ACP session fork failed: ${params.sessionId}`);
+				}
+			} catch (error) {
+				await this.#disposeStandaloneSession(session);
+				throw error;
 			}
-			const forked = await session.fork();
-			if (!forked) {
-				throw new Error(`ACP session fork failed: ${params.sessionId}`);
-			}
-		} catch (error) {
-			await this.#disposeStandaloneSession(session);
-			throw error;
-		}
-		return await this.#registerPreparedSession(session, params.mcpServers ?? [], setToolUIContext);
+			return await this.#registerPreparedSession(session, params.mcpServers ?? [], setToolUIContext);
+		});
 	}
 
 	async #openStoredSession(

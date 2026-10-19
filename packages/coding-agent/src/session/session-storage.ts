@@ -23,6 +23,8 @@ import {
 /** Shared base flags for the held transcript descriptor; callers add `O_APPEND` or `O_TRUNC`. */
 const SESSION_WRITE_FLAGS = fs.constants.O_WRONLY | fs.constants.O_CREAT;
 const utf8Decoder = new TextDecoder("utf-8");
+/** Fatal decoding is required before a text rewrite can claim to preserve original UTF-8 bytes. */
+const strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /**
  * Basename of a rewrite staged by {@link sessionStagingPath}; group 1 is the
@@ -1056,6 +1058,16 @@ export class FileSessionStorage implements SessionStorage {
 		return Bun.file(path).text();
 	}
 
+	/** Read once, rejecting malformed UTF-8 instead of silently replacing bytes before a rewrite. */
+	async readTextStrictUtf8(path: string): Promise<string> {
+		const bytes = await Bun.file(path).arrayBuffer();
+		try {
+			return strictUtf8Decoder.decode(bytes);
+		} catch (cause) {
+			throw new Error(`Session file contains invalid UTF-8: ${path}`, { cause });
+		}
+	}
+
 	readTextSync(path: string): string {
 		return fs.readFileSync(path, "utf8");
 	}
@@ -1281,6 +1293,31 @@ export class FileSessionStorage implements SessionStorage {
 			replaced = true;
 		});
 		return replaced;
+	}
+
+	/** Cold metadata requires exclusivity; live metadata may reference a proven native process lease. */
+	claimSessionForMetadata(sessionId: string, sessionPath: string, allowProcessLease = false): (() => void) | null {
+		const onDisk = readSessionHeaderIdSync(sessionPath);
+		if (onDisk !== undefined && onDisk !== sessionId) return null;
+		let claim = sessionLeases.get(sessionId);
+		if (claim && !allowProcessLease) return null;
+		if (!claim) {
+			const lease = tryAcquireSessionLease(sessionId);
+			if (!lease) return null;
+			claim = { lease, holders: 0 };
+			sessionLeases.set(sessionId, claim);
+		}
+		const held = claim;
+		held.holders++;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			if (sessionLeases.get(sessionId) !== held) return;
+			if (--held.holders > 0) return;
+			sessionLeases.delete(sessionId);
+			held.lease.release();
+		};
 	}
 
 	/**

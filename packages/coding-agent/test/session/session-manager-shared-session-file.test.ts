@@ -150,6 +150,49 @@ function sessionFilesIn(dir: string): string[] {
 }
 
 describe("SessionManager on a session file another omp process writes", () => {
+	it("refuses live and cold title metadata while another process owns the exact ID without forking", async () => {
+		using tempDir = TempDir.createSync("@omp-title-metadata-owner-");
+		const original = await createSession(tempDir);
+		const sessionId = (await readSessionHeaderId(original))!;
+		const { other } = await OtherProcess.resume(tempDir, original);
+		try {
+			await other.run("append owned elsewhere");
+			const before = await Bun.file(original).text();
+			const files = sessionFilesIn(tempDir.path());
+			for (const request of [{}, { title: "must not write", expectedTitle: "" }]) {
+				expect(await SessionManager.accessStoredSessionTitle(original, sessionId, tempDir.path(), request)).toEqual(
+					{
+						sessionId,
+						title: "",
+						status: "busy",
+					},
+				);
+			}
+			const local = await SessionManager.open(original, tempDir.path(), undefined, { suppressBreadcrumb: true });
+			try {
+				expect(await local.accessSessionTitle({ title: "must not fork", expectedTitle: "" })).toMatchObject({
+					sessionId,
+					title: "",
+					status: "busy",
+				});
+				expect(local.getSessionId()).toBe(sessionId);
+				expect(local.getSessionFile()).toBe(original);
+			} finally {
+				await local.close();
+			}
+			expect(await Bun.file(original).text()).toBe(before);
+			expect(sessionFilesIn(tempDir.path())).toEqual(files);
+			expect(await readSessionHeaderId(original)).toBe(sessionId);
+		} finally {
+			await other.close();
+		}
+		expect(await SessionManager.accessStoredSessionTitle(original, sessionId, tempDir.path(), {})).toMatchObject({
+			sessionId,
+			title: "",
+			status: "unchanged",
+		});
+	}, 30_000);
+
 	it("keeps the file with the process that wrote it first and moves the other to one sibling", async () => {
 		using tempDir = TempDir.createSync("@omp-shared-session-file-");
 		const original = await createSession(tempDir);

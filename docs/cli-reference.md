@@ -234,6 +234,70 @@ print-mode disposal semantics when the advisor runtime is enabled.
 
 `--no-ui` (with `--mode rpc` or `--mode rpc-ui`) runs extensions headless: `ctx.hasUI` is `false`, extension dialogs resolve to defaults, and extension presentation updates are dropped. In `rpc-ui`, tool UI such as `ask` still sends `extension_ui_request` frames for the host to answer. Host-issued `login` UI is unaffected. See [RPC startup](./rpc.md#startup).
 
+### ACP session title metadata
+
+OMP advertises `agentCapabilities._meta["omp.sessionTitle"] = true` when the
+optional `_omp/session/title` JSON-RPC extension is available. Clients must check
+that capability rather than sending a prompt or `/rename` as a fallback.
+
+Request fields are `{ sessionId, cwd, title?, expectedTitle?, onlyIfEmpty?, source? }`:
+
+- `sessionId` is the exact native ID and `cwd` is an absolute path identifying the
+  session's canonical working directory. A different project is not a match.
+- Omit `title` to read the raw title (empty string when unnamed), not a display
+  fallback. A found read has status `unchanged`.
+- Writes require a nonempty title. `expectedTitle` is exact compare-and-swap,
+  including `""`; a mismatch returns `conflict` without writing.
+- `onlyIfEmpty: true` keeps every nonempty title. `source` defaults to `"auto"`;
+  automatic updates preserve native user titles. Use `"user"` only for an explicit
+  user rename. An identical title and source returns `unchanged`.
+- Titles use native control-character/whitespace cleanup and the fixed-width
+  native title slot's UTF-8 capacity, with whitespace cleanup repeated after
+  truncation; the response reports that canonical persisted title.
+
+The response is `{ sessionId, title, source?, status }`, with status `updated`,
+`unchanged`, `kept`, `conflict`, `busy`, or `not_found`. The returned ID always
+equals the requested ID. Invalid parameters and persistence failures are RPC
+errors, not success statuses.
+
+Live edits use the exact session manager even during a reply and emit the normal
+`session_info_update`; they neither cancel nor queue a prompt. Live metadata also
+requires a real native lease: it may reference this process's held OS lease, but
+never trusts an ordinary writer's unlocked fallback. Cold edits require an
+exclusive native ownership lease, journal a normal `title_change`, and update
+the title slot and recent-session title index without starting a model or an
+AgentSession. Another owner returns `busy`, never a fork or a new ID. Unavailable
+native ownership locking fails closed. Normal slotted journals need only header
+and tail metadata; oversized or malformed tails stream without retaining chat or
+resolving blobs. Legacy journals require a byte-preserving whole-file rewrite to
+insert their missing title slot.
+Legacy validation and migration share one complete raw-byte read with fatal
+UTF-8 decoding. Invalid UTF-8 or malformed legacy JSONL is rejected before any
+write, leaving the original bytes unchanged rather than replacing or repairing
+them. Modern slotted metadata updates do not require full-history UTF-8 decoding.
+Loaded legacy managers also validate raw UTF-8 before a metadata-triggered full
+rewrite; this check does not change ordinary session-write behavior.
+
+While a title write is in flight, live metadata reads and writes return `busy`
+rather than acknowledging the pending in-memory title. Persistence failures stay
+RPC errors for subsequent metadata access until native persistence recovery has
+cleared the failure. A successful update reports that request's committed title
+and source snapshot, not a concurrent rename's newer, possibly unpersisted state.
+Already-live metadata bypasses the initialization queue: concurrent requests do
+not wait behind a slow title write or its notification delivery to discover
+whether the native manager is busy or its title is already committed.
+
+Cold metadata and load/resume/fork-source initialization coordinate by exact
+native session ID so a newly registered manager cannot adopt a stale cold
+snapshot. This does not serialize or interrupt prompt turns. A missing live
+journal is an error, never a headerless replacement. If a normal synchronous
+chat publish supersedes a metadata rewrite, OMP confirms the native header
+and the exact title-change journal entry before acknowledging success. If a
+later rename was committed in that same publication, the current slot must match
+the last title record at or after this mutation in journal order, using native
+cleanup/truncation, source, and timestamp semantics. The response still contains
+this request's own committed snapshot, never the later rename's title.
+
 ## Subcommands
 
 Run `omp <command> --help` for each command's own flags and examples.

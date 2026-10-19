@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the capability-gated ACP `_omp/session/title` extension for reading and conditionally synchronizing native session titles without prompts, model calls, or session forks; live requests report busy without waiting for an in-flight title write, native ownership leases protect both live and cold metadata, cold writes coordinate with session initialization, and responses acknowledge verified committed title snapshots rather than pending or failed writes. Legacy migration rejects invalid UTF-8 before writing instead of silently replacing original chat bytes.
+
 ## [18.12.2] - 2026-10-18
 
 ### Added
