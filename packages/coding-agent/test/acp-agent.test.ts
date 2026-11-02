@@ -344,8 +344,10 @@ class FakeAgentSession {
 
 	async refreshMCPTools(_tools: unknown[]): Promise<void> {}
 
-	getContextUsage(): undefined {
-		return undefined;
+	contextUsage: { contextWindow: number; tokens?: number } | undefined;
+
+	getContextUsage(): { contextWindow: number; tokens?: number } | undefined {
+		return this.contextUsage;
 	}
 
 	async switchSession(sessionPath: string): Promise<boolean> {
@@ -2796,6 +2798,51 @@ describe("ACP agent", () => {
 		);
 		// Flushed answer belongs to the same live message as the thought chunk.
 		expect(getChunkMessageId(messageChunks[0]!)).toBe(getChunkMessageId(thoughtChunks[0]!)!);
+		expectAcpNotifications(harness.updates);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("reports per-turn requests, duration, and cost in usage_update metadata", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId);
+		if (!session) throw new Error("session not registered");
+		session.contextUsage = { contextWindow: 200_000, tokens: 1_234 };
+
+		const base = makeAssistantMessage("Done.");
+		const assistantMessage = {
+			...base,
+			duration: 2_500,
+			usage: {
+				...base.usage,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.02 },
+			},
+		};
+		session.prompt = async (text: string): Promise<boolean> => {
+			session.promptCalls.push(text);
+			session.isStreaming = true;
+			session.sessionManager.appendMessage(assistantMessage);
+			for (const listener of session.listeners()) {
+				listener({ type: "message_end", message: assistantMessage } as AgentSessionEvent);
+				listener({ type: "agent_end", messages: [assistantMessage] } as AgentSessionEvent);
+			}
+			session.isStreaming = false;
+			return true;
+		};
+
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "go" }],
+		});
+
+		const usageUpdates = harness.updates.filter(
+			update => update.sessionId === created.sessionId && update.update.sessionUpdate === "usage_update",
+		);
+		expect(usageUpdates.length).toBeGreaterThan(0);
+		const turnUsage = usageUpdates.at(-1)!.update._meta?.["omp.turnUsage"];
+		expect(turnUsage).toEqual({ requests: 1, durationMs: 2_500, cost: 0.02, currency: "USD" });
 		expectAcpNotifications(harness.updates);
 
 		harness.abortController.abort();

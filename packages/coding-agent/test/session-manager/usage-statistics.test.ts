@@ -284,6 +284,35 @@ describe("SessionManager usage statistics", () => {
 		expect(stats.subagentCost).toBeCloseTo(0.12);
 	});
 
+	it("counts assistant replies as model requests with their request duration", () => {
+		const session = SessionManager.inMemory();
+		const usage = {
+			input: 10,
+			output: 5,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 15,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.01 },
+		};
+		for (const [index, duration] of [1_500, 2_500].entries()) {
+			session.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: `reply ${index}` }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				usage,
+				stopReason: "stop",
+				duration,
+				timestamp: index + 1,
+			});
+		}
+
+		const stats = session.getUsageStatistics();
+		expect(stats.requests).toBe(2);
+		expect(stats.durationMs).toBe(4_000);
+	});
+
 	it("keeps orchestration usage out of ordinary input while preserving total tokens", () => {
 		const session = SessionManager.inMemory();
 

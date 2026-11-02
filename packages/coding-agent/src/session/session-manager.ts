@@ -418,6 +418,8 @@ function emptyUsageStatistics(): UsageStatistics {
 		premiumRequests: 0,
 		cost: 0,
 		subagentCost: 0,
+		requests: 0,
+		durationMs: 0,
 	};
 }
 
@@ -604,6 +606,15 @@ class SessionEntryIndex {
 
 		const usage = entryUsage(entry);
 		addUsage(this.#usage, usage);
+		// One assistant message is one model request. `isNew` keeps rewrites of
+		// the same entry from double counting.
+		if (isNew && entry.type === "message" && entry.message.role === "assistant") {
+			this.#usage.requests = (this.#usage.requests ?? 0) + 1;
+			const duration = entry.message.duration;
+			if (typeof duration === "number" && Number.isFinite(duration) && duration > 0) {
+				this.#usage.durationMs = (this.#usage.durationMs ?? 0) + duration;
+			}
+		}
 		// Completed `task` results carry the child's spend; tracked apart so the
 		// status line can split the session's own cost from its subagents'.
 		if (usage && entry.type === "message" && entry.message.role === "toolResult") {

@@ -399,6 +399,14 @@ export interface UsageStatistics {
 	cost: number;
 	/** Portion of {@link cost} carried by completed `task` results (direct children's spend). */
 	subagentCost: number;
+	/**
+	 * Assistant messages recorded on the active branch, i.e. model requests
+	 * that produced a reply. Optional so older snapshots and fixtures stay
+	 * valid; readers treat a missing value as 0.
+	 */
+	requests?: number;
+	/** Summed provider-reported request durations in milliseconds, when known. */
+	durationMs?: number;
 }
 /**
  * True when a raw JSONL line is a complete `message` record carrying an

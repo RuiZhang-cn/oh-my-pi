@@ -1930,7 +1930,7 @@ export class AcpAgent implements Agent {
 		if (event.type === "agent_end") {
 			await this.#flushMissedFinalAssistantText(record, event);
 			await this.#flushUnreportedTurnError(record, event);
-			await this.#emitEndOfTurnUpdates(record);
+			await this.#emitEndOfTurnUpdates(record, promptTurn);
 			await this.#waitForAcpPromptIdle(record);
 			record.liveMessageId = undefined;
 			record.liveMessageProgress = undefined;
@@ -2660,12 +2660,25 @@ export class AcpAgent implements Agent {
 		await this.#emitAvailableCommandsUpdate(record);
 	}
 
-	async #emitEndOfTurnUpdates(record: ManagedSessionRecord): Promise<void> {
+	async #emitEndOfTurnUpdates(record: ManagedSessionRecord, promptTurn: PromptTurnState): Promise<void> {
 		const sessionId = record.session.sessionId;
 
 		const contextUsage = record.session.getContextUsage();
 		if (contextUsage) {
 			const usageStats = record.session.sessionManager.getUsageStatistics();
+			const baseline = promptTurn.usageBaseline;
+			// Clients render per-reply billing from these turn deltas; the
+			// cumulative cost below cannot separate history from this turn.
+			const requests = Math.max(0, (usageStats.requests ?? 0) - (baseline.requests ?? 0));
+			const durationMs = Math.max(0, (usageStats.durationMs ?? 0) - (baseline.durationMs ?? 0));
+			const turnCost = Math.max(0, usageStats.cost - baseline.cost);
+			const turnUsage: Record<string, number | string> = {};
+			if (requests > 0) turnUsage.requests = requests;
+			if (durationMs > 0) turnUsage.durationMs = durationMs;
+			if (turnCost > 1e-9) {
+				turnUsage.cost = turnCost;
+				turnUsage.currency = "USD";
+			}
 			await this.#connection.sessionUpdate({
 				sessionId,
 				update: {
@@ -2673,6 +2686,7 @@ export class AcpAgent implements Agent {
 					size: contextUsage.contextWindow,
 					used: contextUsage.tokens ?? 0,
 					cost: usageStats.cost > 0 ? { amount: usageStats.cost, currency: "USD" } : undefined,
+					...(Object.keys(turnUsage).length > 0 ? { _meta: { "omp.turnUsage": turnUsage } } : {}),
 				},
 			});
 		}
@@ -2700,6 +2714,8 @@ export class AcpAgent implements Agent {
 			premiumRequests: usage.premiumRequests,
 			cost: usage.cost,
 			subagentCost: usage.subagentCost,
+			requests: usage.requests ?? 0,
+			durationMs: usage.durationMs ?? 0,
 		};
 	}
 
