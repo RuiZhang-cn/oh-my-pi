@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import type {
 	SessionNotification,
 	SessionUpdate,
@@ -265,6 +266,42 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		}
 		case "todo_auto_clear":
 			return [toSessionNotification(sessionId, { sessionUpdate: "plan", entries: [] })];
+		case "auto_retry_start": {
+			const reason = event.errorMessage.replace(/\s+/g, " ").trim().slice(0, 240);
+			const wait = event.delayMs > 0 ? ` in ${Math.max(1, Math.round(event.delayMs / 1000))}s` : "";
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "agent_message_chunk",
+					content: {
+						type: "text",
+						text: `\n\n🔁 Retry ${event.attempt}/${event.maxAttempts}${wait}: ${reason}\n\n`,
+					},
+					messageId: randomUUID(),
+				}),
+			];
+		}
+		case "retry_fallback_applied": {
+			const reason = event.reason?.replace(/\s+/g, " ").trim();
+			const detail = reason ? `: ${reason.slice(0, 240)}` : "";
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "agent_message_chunk",
+					content: {
+						type: "text",
+						text: `\n\n⚠️ Fallback: ${event.from} → ${event.to} (${event.role})${detail}\n\n`,
+					},
+					messageId: randomUUID(),
+				}),
+			];
+		}
+		case "retry_fallback_succeeded":
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "agent_message_chunk",
+					content: { type: "text", text: `\n\n✅ Fallback succeeded on ${event.model}\n\n` },
+					messageId: randomUUID(),
+				}),
+			];
 		default:
 			return [];
 	}

@@ -807,6 +807,25 @@ export const cfgRetryFallbackOn = register({
 	},
 });
 
+export const cfgRetryFallbackAfterRetries = register({
+	id: "retry.fallbackAfterRetries",
+	type: "number",
+	default: 0,
+	ui: {
+		tab: "model",
+		group: "Retry & Fallback",
+		label: "Retries Before Fallback",
+		description:
+			"Retry a retryable error on the same model this many times (with backoff) before switching to retry.fallbackChains. 0 switches on the first failure. Errors the same model cannot recover from switch at once.",
+		options: [
+			{ value: "0", label: "Switch immediately" },
+			{ value: "1", label: "1 retry first" },
+			{ value: "2", label: "2 retries first" },
+			{ value: "3", label: "3 retries first" },
+		],
+	},
+});
+
 export const cfgRetryRateLimitWalksChain = register({
 	id: "retry.rateLimitWalksChain",
 	type: "boolean",
@@ -928,6 +947,7 @@ export const cfgRetry = combine({
 	waitForUsageReset: cfgRetryWaitForUsageReset,
 	modelFallback: cfgRetryModelFallback,
 	fallbackOn: cfgRetryFallbackOn,
+	fallbackAfterRetries: cfgRetryFallbackAfterRetries,
 	rateLimitWalksChain: cfgRetryRateLimitWalksChain,
 	usageAwareFallback: cfgRetryUsageAwareFallback,
 	usageReservePct: cfgRetryUsageReservePct,

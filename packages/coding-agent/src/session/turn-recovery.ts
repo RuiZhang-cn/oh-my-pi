@@ -3016,9 +3016,31 @@ export class TurnRecovery {
 			// chains say.
 			const refusalWalkKey = this.#refusalWalkKey(currentSelector);
 			const refusalWalkRepeats = classifierRefusal && this.#refusalWalkTried.has(refusalWalkKey);
+			// Each term is a branch below that, with no switch, ends the turn instead
+			// (a spent budget, a refusal or account-policy denial, a hard-error or
+			// Fast-degrade consult the classifier would not retry, a wait past the
+			// fail-fast cap), or, under `retry.rateLimitWalksChain`, a rate limit on
+			// this model, which the next attempt re-hits.
+			const sameModelRetryAvailable =
+				!retryBudgetExhausted &&
+				!sourceRateLimited &&
+				!classifierRefusal &&
+				!accountPolicyDenial &&
+				!((options?.fireworksFastFallback || options?.hardErrorFallback) && !this.isRetryableError(message)) &&
+				!exceedsDelayCap(
+					usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs
+						? parsedRetryAfterMs
+						: delayMs,
+				);
+			// `retry.fallbackAfterRetries` spends that many same-model retries (with
+			// backoff, announced via `auto_retry_start`) before the chain is consulted,
+			// so a transient 5xx does not switch models on its first occurrence.
+			const fallbackDeferred =
+				sameModelRetryAvailable && this.#retryAttempt <= Math.max(0, retrySettings.fallbackAfterRetries);
 			if (
 				allowModelFallback &&
 				retrySettings.modelFallback &&
+				!fallbackDeferred &&
 				retryFallbackAdmits(retrySettings.fallbackOn, AIError.is(id, AIError.Flag.UsageLimit)) &&
 				!staleUsageLimit &&
 				!thinkingLoop &&
@@ -3045,26 +3067,8 @@ export class TurnRecovery {
 					preserveFailedTurn,
 					wrapAround: longUsageLimitFallback,
 					// Deferring a chain candidate only pays when the code below makes
-					// another attempt on this model that can succeed. Each term is a
-					// branch below that, with no switch, ends the turn instead (a spent
-					// budget, a refusal or account-policy denial, a hard-error or
-					// Fast-degrade consult the classifier would not retry, a wait past
-					// the fail-fast cap), or, under `retry.rateLimitWalksChain`, a rate
-					// limit on this model, which the next attempt re-hits.
-					sameModelRetryAvailable:
-						!retryBudgetExhausted &&
-						!sourceRateLimited &&
-						!classifierRefusal &&
-						!accountPolicyDenial &&
-						!(
-							(options?.fireworksFastFallback || options?.hardErrorFallback) &&
-							!this.isRetryableError(message)
-						) &&
-						!exceedsDelayCap(
-							usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs
-								? parsedRetryAfterMs
-								: delayMs,
-						),
+					// another attempt on this model that can succeed.
+					sameModelRetryAvailable,
 				});
 			}
 			// Auto fallback from a Fireworks Fast variant to its base model. Independent

@@ -5,6 +5,8 @@
 ### Added
 
 - ACP `session/fork` accepts `_meta["omp.forkDropUserTurns"]: N` to fork without the last N user turns, advertised under `agentCapabilities._meta`, so clients that edit and resend the latest prompt keep the earlier context
+- `retry.fallbackAfterRetries` (default 0) retries a retryable error on the same model that many times with backoff before walking `retry.fallbackChains`; errors the same model cannot recover from still switch at once
+- ACP clients now see automatic retries (`🔁 Retry n/m in Ns: <error>`) and model fallbacks (`⚠️ Fallback: from → to`, `✅ Fallback succeeded on <model>`) as agent message text
 
 ## [18.18.6] - 2026-11-09
 

@@ -1289,4 +1289,45 @@ describe("ACP event mapper", () => {
 			locations: [{ path: path.resolve("/repo", "src/foo.ts") }],
 		});
 	});
+
+	it("surfaces retries and fallback transitions to the ACP client", () => {
+		const retry = mapAgentSessionEventToAcpSessionUpdates(
+			{ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 2400, errorMessage: "503 No available\naccounts" },
+			"session-1",
+		);
+		expectAcpNotifications(retry);
+		expect(retry[0]?.update).toMatchObject({
+			sessionUpdate: "agent_message_chunk",
+			content: { type: "text", text: "\n\n🔁 Retry 1/3 in 2s: 503 No available accounts\n\n" },
+		});
+
+		const applied = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "retry_fallback_applied",
+				from: "hualong/deepseek-v4.1-flash",
+				to: "nexav/deepseek-v4.1-flash",
+				role: "default",
+				reason: "429 rate limit\nretry after 3s",
+			},
+			"session-1",
+		);
+		expectAcpNotifications(applied);
+		expect(applied[0]?.update).toMatchObject({
+			sessionUpdate: "agent_message_chunk",
+			content: {
+				type: "text",
+				text: "\n\n⚠️ Fallback: hualong/deepseek-v4.1-flash → nexav/deepseek-v4.1-flash (default): 429 rate limit retry after 3s\n\n",
+			},
+		});
+
+		const succeeded = mapAgentSessionEventToAcpSessionUpdates(
+			{ type: "retry_fallback_succeeded", model: "nexav/deepseek-v4.1-flash", role: "default" },
+			"session-1",
+		);
+		expectAcpNotifications(succeeded);
+		expect(succeeded[0]?.update).toMatchObject({
+			sessionUpdate: "agent_message_chunk",
+			content: { type: "text", text: "\n\n✅ Fallback succeeded on nexav/deepseek-v4.1-flash\n\n" },
+		});
+	});
 });

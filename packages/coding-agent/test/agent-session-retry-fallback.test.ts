@@ -3730,6 +3730,60 @@ describe("AgentSession retry fallback", () => {
 			expect(getLastAssistantMessage(session).stopReason).toBe(stop);
 		},
 	);
+
+	it.each([
+		{ after: 0, error: "503 Service Unavailable", failures: 9, requests: ["primary", "fallback"] },
+		{ after: 2, error: "503 Service Unavailable", failures: 1, requests: ["primary", "primary"] },
+		{ after: 2, error: "503 Service Unavailable", failures: 9, requests: ["primary", "primary", "primary", "fallback"] },
+		{ after: 2, error: "unrecoverable model quirk", failures: 9, requests: ["primary", "fallback"] },
+	] as const)(
+		"retry.fallbackAfterRetries $after: $error failing $failures time(s) requests $requests",
+		async ({ after, error, failures, requests }) => {
+			mockSchedulerWaitWithClock();
+			const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+			const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+			if (!primaryModel || !fallbackModel) {
+				throw new Error("Expected bundled test models to exist");
+			}
+			const mock = createMockModel();
+			const requested: string[] = [];
+			let primaryFailures = 0;
+			const agent = new Agent({
+				getApiKey: model => `${model.provider}-test-key`,
+				initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (model, context, options) => {
+					const onPrimary = model.provider === primaryModel.provider;
+					requested.push(onPrimary ? "primary" : "fallback");
+					if (onPrimary && primaryFailures < failures) {
+						primaryFailures++;
+						mock.push({ throw: error });
+					} else {
+						mock.push({ content: ["ok"] });
+					}
+					return mock.stream(model, context, options);
+				},
+			});
+			session = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				settings: Settings.isolated({
+					"compaction.enabled": false,
+					"retry.maxRetries": 3,
+					"retry.fallbackAfterRetries": after,
+					"retry.fallbackChains": {
+						[`${primaryModel.provider}/${primaryModel.id}`]: [`${fallbackModel.provider}/${fallbackModel.id}`],
+					},
+				}),
+				modelRegistry,
+			});
+
+			await session.prompt("Retry before switching");
+			await session.waitForIdle();
+
+			expect(requested).toEqual([...requests]);
+			expect(getLastAssistantMessage(session).stopReason).toBe("stop");
+		},
+	);
 	it("surfaces immutable Anthropic thinking errors without retry fallback", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallbackModel = getBundledModel("anthropic", "claude-opus-4-5");
