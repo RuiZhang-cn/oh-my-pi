@@ -467,10 +467,11 @@ class FakeAgentSession {
 
 	async compact(_instructions?: string, _options?: unknown): Promise<void> {}
 
-	async fork(): Promise<boolean> {
+	async fork(entryId?: string): Promise<boolean> {
 		await this.sessionManager.flush();
-		const forked = await this.sessionManager.fork();
-		if (!forked) {
+		if (entryId !== undefined) {
+			if (!this.sessionManager.createBranchedSession(entryId)) return false;
+		} else if (!(await this.sessionManager.fork())) {
 			return false;
 		}
 		this.sessionId = this.sessionManager.getSessionId();
@@ -764,6 +765,48 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it("forks without the trailing user turns requested via omp.forkDropUserTurns", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const source = harness.findSession(created.sessionId)!;
+		const at = Date.now();
+		source.sessionManager.appendMessage({ role: "user", content: "first", timestamp: at });
+		source.sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "first reply" }],
+			api: TEST_MODELS[0]!.api,
+			provider: TEST_MODELS[0]!.provider,
+			model: TEST_MODELS[0]!.id,
+			stopReason: "stop",
+			timestamp: at + 1,
+		} as never);
+		source.sessionManager.appendMessage({ role: "user", content: "edited away", timestamp: at + 2 });
+		await source.sessionManager.flush();
+
+		const forked = await harness.agent.unstable_forkSession({
+			sessionId: created.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+			_meta: { "omp.forkDropUserTurns": 1 },
+		});
+		const userTexts = harness
+			.findSession(forked.sessionId)!
+			.sessionManager.buildSessionContext()
+			.messages.filter(message => message.role === "user")
+			.map(message => message.content);
+		expect(userTexts).toEqual(["first"]);
+
+		await expect(
+			harness.agent.unstable_forkSession({
+				sessionId: created.sessionId,
+				cwd: harness.cwdA,
+				mcpServers: [],
+				_meta: { "omp.forkDropUserTurns": 2 },
+			}),
+		).rejects.toThrow("no messages before");
+		await harness.agent.dispose();
 	});
 
 	it("advertises plan mode and emits schema-valid mode updates", async () => {

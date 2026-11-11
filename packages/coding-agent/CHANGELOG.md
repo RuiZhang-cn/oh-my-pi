@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- ACP `session/fork` accepts `_meta["omp.forkDropUserTurns"]: N` to fork without the last N user turns, advertised under `agentCapabilities._meta`, so clients that edit and resend the latest prompt keep the earlier context
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

@@ -362,6 +362,42 @@ function steeringQueueFromMeta(meta: unknown): "steering" | "followUp" {
 	return "steering";
 }
 
+/**
+ * omp extension on `session/fork`: `_meta["omp.forkDropUserTurns"] = N` forks the
+ * source without its last N user turns (each user message and everything after it).
+ * Hosts that let users edit-and-resend the latest message keep the earlier context
+ * without replaying history. Advertised under `agentCapabilities._meta`.
+ */
+const OMP_FORK_DROP_USER_TURNS = "omp.forkDropUserTurns";
+
+function forkDropUserTurnsFromMeta(meta: unknown): number {
+	if (typeof meta !== "object" || meta === null) return 0;
+	const value = (meta as Record<string, unknown>)[OMP_FORK_DROP_USER_TURNS];
+	if (value === undefined) return 0;
+	if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+		throw new Error(`${OMP_FORK_DROP_USER_TURNS} must be a positive integer`);
+	}
+	return value;
+}
+
+/** Last message entry kept when dropping the final `turns` user messages of the active branch. */
+function resolveDropUserTurnsCut(session: AgentSession, turns: number): string {
+	const branch = session.sessionManager.getBranch();
+	let remaining = turns;
+	let index = branch.length - 1;
+	for (; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.type === "message" && entry.message.role === "user" && --remaining === 0) break;
+	}
+	if (index < 0) {
+		throw new Error(`ACP session has fewer than ${turns} user turns to drop`);
+	}
+	for (let cut = index - 1; cut >= 0; cut--) {
+		if (branch[cut].type === "message") return branch[cut].id;
+	}
+	throw new Error("ACP session has no messages before the dropped user turns");
+}
+
 type AcpCompactionNotification = {
 	method: "_omp/compaction/start" | "_omp/compaction/end";
 	params: Record<string, unknown>;
@@ -1056,7 +1092,7 @@ export class AcpAgent implements Agent {
 			authMethods,
 			agentCapabilities: {
 				loadSession: true,
-				_meta: { "omp.sessionTitle": true },
+				_meta: { "omp.sessionTitle": true, [OMP_FORK_DROP_USER_TURNS]: true },
 				mcpCapabilities: {
 					http: true,
 					sse: true,
@@ -1979,7 +2015,9 @@ export class AcpAgent implements Agent {
 				if (!success) {
 					throw new Error(`ACP session fork was cancelled: ${params.sessionId}`);
 				}
-				const forked = await session.fork();
+				const dropUserTurns = forkDropUserTurnsFromMeta(params._meta);
+				const cutEntryId = dropUserTurns > 0 ? resolveDropUserTurnsCut(session, dropUserTurns) : undefined;
+				const forked = await session.fork(cutEntryId);
 				if (!forked) {
 					throw new Error(`ACP session fork failed: ${params.sessionId}`);
 				}
